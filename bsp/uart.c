@@ -14,6 +14,10 @@
 
 #define UARTFR_TXFF      (1u << 5)
 
+/*
+ * Chinese: 初始化 UART，設定鮑率、資料位、停止位等參數。
+ * English: Initializes the UART, setting parameters like baud rate, data bits, stop bits, etc.
+ */
 void uart_init(void)
 {
     mmio_write32(UARTCR, 0u);
@@ -24,6 +28,10 @@ void uart_init(void)
     mmio_write32(UARTCR, (1u << 9) | (1u << 8) | (1u << 0));
 }
 
+/*
+ * Chinese: 透過 UART 傳送一個字元。
+ * English: Transmits a single character via UART.
+ */
 void uart_putc(char c)
 {
     if (c == '\n') {
@@ -34,6 +42,10 @@ void uart_putc(char c)
     mmio_write32(UARTDR, (uint32_t)c);
 }
 
+/*
+ * Chinese: 透過 UART 傳送一個以 null 結尾的字串。
+ * English: Transmits a null-terminated string via UART.
+ */
 void uart_puts(const char *s)
 {
     while (*s != '\0') {
@@ -41,6 +53,10 @@ void uart_puts(const char *s)
     }
 }
 
+/*
+ * Chinese: 將一個無符號長整數以十六進位格式透過 UART 傳送。
+ * English: Transmits an unsigned long integer in hexadecimal format via UART.
+ */
 void uart_write_hex(unsigned long value)
 {
     static const char digits[] = "0123456789ABCDEF";
@@ -49,6 +65,10 @@ void uart_write_hex(unsigned long value)
     }
 }
 
+/*
+ * Chinese: 將一個 32 位元無符號整數以十進位格式透過 UART 傳送。
+ * English: Transmits a 32-bit unsigned integer in decimal format via UART.
+ */
 void uart_write_dec(uint32_t value)
 {
     char buffer[16];

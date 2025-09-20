@@ -20,6 +20,10 @@ from_el3:
         msr     sp_el1, x1
         mov     x1, #0x3c5
         msr     spsr_el3, x1
+        mrs     x1, ICC_SRE_EL3
+        orr     x1, x1, #0x7
+        msr     ICC_SRE_EL3, x1
+        isb
         adr     x1, el1_entry
         msr     elr_el3, x1
         mov     x1, #0x33
@@ -35,6 +39,10 @@ from_el2:
         msr     sp_el1, x1
         mov     x1, #0x3c5
         msr     spsr_el2, x1
+        mrs     x1, ICC_SRE_EL2
+        orr     x1, x1, #0x7
+        msr     ICC_SRE_EL2, x1
+        isb
         adr     x1, el1_entry
         msr     elr_el2, x1
         mov     x1, #0

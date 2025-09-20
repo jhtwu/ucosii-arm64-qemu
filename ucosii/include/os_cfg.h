@@ -100,7 +100,7 @@
 #define OS_TMR_CFG_TICKS_PER_SEC  0u
 
 /* ------------------------- TIME ----------------------------- */
-#define OS_TIME_DLY_HMSM_EN       0u
+#define OS_TIME_DLY_HMSM_EN       1u
 #define OS_TIME_DLY_RESUME_EN     0u
 #define OS_TIME_GET_SET_EN        1u
 #define OS_TIME_TICK_HOOK_EN      0u

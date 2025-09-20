@@ -13,6 +13,7 @@
     .extern OSPrioHighRdy
     .extern OSTCBCur
     .extern OSTCBHighRdy
+    .extern irq_dispatch
 
     .global OSStartHighRdy
     .global OSCtxSw
@@ -133,6 +134,8 @@ OSIntCtxSw:
 
     .global OS_CPU_ARM_ExceptIrqHndlr
 OS_CPU_ARM_ExceptIrqHndlr:
-    eret
+    SAVE_CONTEXT
+    bl      irq_dispatch
+    RESTORE_AND_ERET
 
     .end

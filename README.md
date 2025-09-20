@@ -1,8 +1,8 @@
 # uC/OS-II ARM64 QEMU Demo / uC/OS-II ARM64 QEMU 範例
 
-這個專案提供在 QEMU virt 平台上執行的 uC/OS-II ARMv8-A 範例，藉由兩個任務交替列印訊息來展示情境切換。
+這個專案提供在 QEMU virt 平台上執行的 uC/OS-II ARMv8-A 範例，藉由兩個任務交替列印訊息來展示情境切換。原始碼包含詳盡的中英文註解，方便理解實作細節。
 
-This repository showcases a uC/OS-II demo on the QEMU virt ARMv8-A machine. Two tasks cooperatively alternate UART output to highlight context switches.
+This repository showcases a uC/OS-II demo on the QEMU virt ARMv8-A machine. Two tasks cooperatively alternate UART output to highlight context switches. The source code is extensively commented in both Chinese and English to facilitate understanding of the implementation details.
 
 ## 需求 / Requirements
 

@@ -12,12 +12,17 @@
 
 #include <ucos_ii.h>
 
+#include "gic.h"
 #include "uart.h"
+#include "timer.h"
+#include "mmio.h"
 
-#define BUSY_DELAY       (2000000u)
-#define TASK_STACK_SIZE  512u
-#define TASK_A_PRIO         3u
-#define TASK_B_PRIO         4u
+#define BUSY_DELAY          (2000u)
+#define TASK_STACK_SIZE     512u
+#define TASK_A_PRIO            3u
+#define TASK_B_PRIO            4u
+#define ENABLE_TASK_LOG        1
+#define TIMER_INTERRUPT_ID    30u
 
 static OS_STK task_a_stack[TASK_STACK_SIZE];
 static OS_STK task_b_stack[TASK_STACK_SIZE];
@@ -33,32 +38,22 @@ static void task_a(void *p_arg)
      * English: Task A prints its counter, performs a short busy wait, wakes Task B, then suspends itself.
      */
     for (;;) {
-        uart_putc('A');
-        uart_putc(':');
-        uart_putc(' ');
-        uart_write_dec(counter++);
-        uart_putc('\n');
-
-        for (volatile uint64_t i = 0; i < BUSY_DELAY; ++i) {
-            __asm__ volatile("nop");
+        if (ENABLE_TASK_LOG) {
+            uart_putc('A');
+            uart_putc(':');
+            uart_putc(' ');
+            uart_write_dec(counter);
+            uart_putc('\n');
         }
+        ++counter;
+
+        OSTimeDlyHMSM(0, 0, 0, 10);
 
         INT8U err;
-
         OSSchedLock();
         err = OSTaskResume(TASK_B_PRIO);
-        if (err != OS_ERR_NONE) {
-            uart_puts("[ERROR] resume B = ");
-            uart_write_dec(err);
-            uart_putc('\n');
-        }
         err = OSTaskSuspend(OS_PRIO_SELF);
         OSSchedUnlock();
-        if (err != OS_ERR_NONE) {
-            uart_puts("[ERROR] suspend A = ");
-            uart_write_dec(err);
-            uart_putc('\n');
-        }
     }
 }
 
@@ -73,32 +68,22 @@ static void task_b(void *p_arg)
      * English: Task B mirrors Task A—printing, delaying, waking the peer, and suspending, producing the alternation.
      */
     for (;;) {
-        uart_putc('B');
-        uart_putc(':');
-        uart_putc(' ');
-        uart_write_dec(counter++);
-        uart_putc('\n');
-
-        for (volatile uint64_t i = 0; i < BUSY_DELAY; ++i) {
-            __asm__ volatile("nop");
+        if (ENABLE_TASK_LOG) {
+            uart_putc('B');
+            uart_putc(':');
+            uart_putc(' ');
+            uart_write_dec(counter);
+            uart_putc('\n');
         }
+        ++counter;
+
+        OSTimeDlyHMSM(0, 0, 0, 10);
 
         INT8U err;
-
         OSSchedLock();
         err = OSTaskResume(TASK_A_PRIO);
-        if (err != OS_ERR_NONE) {
-            uart_puts("[ERROR] resume A = ");
-            uart_write_dec(err);
-            uart_putc('\n');
-        }
         err = OSTaskSuspend(OS_PRIO_SELF);
         OSSchedUnlock();
-        if (err != OS_ERR_NONE) {
-            uart_puts("[ERROR] suspend B = ");
-            uart_write_dec(err);
-            uart_putc('\n');
-        }
     }
 }
 
@@ -111,6 +96,21 @@ int main(void)
     uart_puts("[BOOT] main enter\n");
     uart_init();
     uart_puts("\n[BOOT] uC/OS-II ARMv8 demo starting\n");
+
+    uart_puts("[BOOT] Initialising GICv3 and timer\n");
+    gic_init();
+    timer_init(OS_TICKS_PER_SEC);
+
+    uint64_t timer_ctl;
+    do {
+        __asm__ volatile("mrs %0, cntp_ctl_el0" : "=r"(timer_ctl));
+    } while ((timer_ctl & (1u << 2)) == 0u);
+    uart_puts("[BOOT] timer pending detected\n");
+
+    uint32_t pending = mmio_read32(0x080A2000u);
+    uart_puts("[BOOT] GICR_ISPENDR0 now = ");
+    uart_write_hex(pending);
+    uart_putc('\n');
 
     OSInit();
 
@@ -142,11 +142,7 @@ int main(void)
     uart_write_dec(err);
     uart_puts("\n");
 
-    uart_puts("[BOOT] Scheduler starting\n");
+    __asm__ volatile("msr daifclr, #0x2");
 
     OSStart();
-
-    uart_puts("[ERROR] OSStart returned\n");
-    for (;;) {
-    }
 }
