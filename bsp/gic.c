@@ -22,9 +22,102 @@
 #define GICR_ICFGR0         (GICR_SGI_BASE + 0x0C00u)
 #define GICR_IPRIORITYR(n)  (GICR_SGI_BASE + 0x0400u + ((n) * 4u))
 
+/* GIC CPU Interface constants from armv8 project */
+#define ICC_SRE_EL1_SRE         (1U << 0)
+#define ICC_CTLR_EL1_EOImode_drop_dir   (0U << 1)
+#define DEFAULT_PMR_VALUE       0xF0u
+
+/* System register access functions like armv8 */
+static inline uint32_t gic_read_sre(void)
+{
+    uint32_t val;
+    __asm__ volatile("mrs %0, S3_0_c12_c12_5" : "=r"(val)); 
+    return val;
+}
+
+static inline void gic_write_sre(uint32_t val)
+{
+    __asm__ volatile("msr S3_0_c12_c12_5, %x0" :: "rZ"(val)); 
+    __asm__ volatile("isb");
+}
+
+static inline void gic_write_pmr(uint32_t val)
+{
+    __asm__ volatile("msr S3_0_c4_c6_0, %x0" :: "rZ"(val)); 
+}
+
+static inline void gic_write_ctlr(uint32_t val)
+{
+    __asm__ volatile("msr S3_0_c12_c12_4, %x0" :: "rZ"(val)); 
+    __asm__ volatile("isb");
+}
+
+static inline void gic_write_grpen1(uint32_t val)
+{
+    __asm__ volatile("msr S3_0_c12_c12_7, %x0" :: "rZ"(val)); 
+    __asm__ volatile("isb");
+}
+
+static inline void gic_write_bpr1(uint32_t val)
+{
+    __asm__ volatile("msr S3_0_c12_c12_3, %x0" :: "rZ"(val)); 
+}
+
+static inline int gic_enable_sre(void)
+{
+    uint32_t val;
+
+    uart_puts("[GIC] Enabling system register interface\n");
+
+    val = gic_read_sre();
+    if (val & ICC_SRE_EL1_SRE) {
+        uart_puts("[GIC] SRE already enabled\n");
+        return 1;
+    }
+
+    uart_puts("[GIC] Setting SRE bit\n");
+    val |= ICC_SRE_EL1_SRE;
+    gic_write_sre(val);
+    val = gic_read_sre();
+
+    uart_puts("[GIC] SRE enable result: ");
+    uart_write_hex(val);
+    uart_putc('\n');
+    return !!(val & ICC_SRE_EL1_SRE);
+}
+
+static void gic_cpu_sys_reg_init(void)
+{
+    uart_puts("[GIC] CPU system register initialization\n");
+    
+    /* Enable system register interface */
+    if (!gic_enable_sre()) {
+        uart_puts("[GIC] ERROR: Unable to set SRE (disabled at EL2)\n");
+        return;
+    }
+
+    /* Set priority mask register */
+    uart_puts("[GIC] Setting priority mask\n");
+    gic_write_pmr(DEFAULT_PMR_VALUE);
+
+    /* Set binary point register */
+    uart_puts("[GIC] Setting binary point register\n");
+    gic_write_bpr1(0);
+
+    /* Set control register - EOI deactivates interrupt too */
+    uart_puts("[GIC] Setting control register\n");
+    gic_write_ctlr(ICC_CTLR_EL1_EOImode_drop_dir);
+
+    /* Enable Group 1 interrupts */
+    uart_puts("[GIC] Enabling Group 1 interrupts\n");
+    gic_write_grpen1(1);
+    
+    uart_puts("[GIC] CPU interface system registers configured\n");
+}
+
 void gic_init(void)
 {
-    uart_puts("[GIC] Starting armv8-style GIC initialization\n");
+    uart_puts("[GIC] Starting complete armv8-style GIC initialization\n");
     
     /* Test distributor access */
     uint32_t gicd_ctrl = mmio_read32(GICD_CTLR);
@@ -32,59 +125,58 @@ void gic_init(void)
     uart_write_hex(gicd_ctrl);
     uart_putc('\n');
     
-    /* Follow armv8 project sequence: gic_dist_init() then gic_cpu_init() */
+    /* Phase 1: Distributor initialization */
     uart_puts("[GIC] Phase 1: Distributor initialization\n");
-    
-    /* Disable distributor first */
     mmio_write32(GICD_CTLR, 0u);
+    mmio_write32(GICD_CTLR, GICD_CTLR_ENABLE);
     
-    /* Enable distributor with proper flags like armv8 */
-    mmio_write32(GICD_CTLR, 0x37u);  /* ARE_S | ARE_NS | Enable_G1S | Enable_G1NS | Enable_G0 */
+    /* Phase 2: Redistributor initialization */
+    uart_puts("[GIC] Phase 2: Redistributor initialization\n");
     
-    uart_puts("[GIC] Phase 2: CPU interface initialization\n");
+    /* Set all PPIs/SGIs to Group 1 */
+    mmio_write32(GICR_IGROUPR0, 0xFFFFFFFFu);
     
-    /* Configure redistributor like armv8 */
-    uart_puts("[GIC] Configuring redistributor for timer interrupt\n");
-    
-    /* Set all PPIs/SGIs to Group 1 like armv8 */
-    mmio_write32(GICR_SGI_BASE + 0x0080u, 0xFFFFFFFFu);  /* GICR_IGROUPR0 */
-    
-    /* Configure timer interrupt 27 specifically */
+    /* Configure timer interrupt 27 */
     uint32_t timer_id = 27u;
     
-    /* Set priority for interrupt 27 */
-    uint32_t priority_reg = GICR_SGI_BASE + 0x0400u + (timer_id / 4u) * 4u;
+    /* Set priority */
+    uint32_t priority_reg = GICR_IPRIORITYR(timer_id / 4u);
     uint32_t priority = mmio_read32(priority_reg);
     uint32_t shift = (timer_id % 4u) * 8u;
     priority &= ~(0xFFu << shift);
-    priority |= (0x80u << shift);  /* Medium priority */
+    priority |= (0x80u << shift);
     mmio_write32(priority_reg, priority);
     
-    /* Enable interrupt 27 */
-    mmio_write32(GICR_SGI_BASE + 0x0100u, (1u << timer_id));  /* GICR_ISENABLER0 */
+    /* Enable interrupt */
+    mmio_write32(GICR_ISENABLER0, (1u << timer_id));
     
     /* Configure as edge-triggered */
-    uint32_t cfg_reg = GICR_SGI_BASE + 0x0C00u + 4u;  /* GICR_ICFGR1 for interrupts 16-31 */
+    uint32_t cfg_reg = GICR_ICFGR0 + 4u;
     uint32_t cfg = mmio_read32(cfg_reg);
     uint32_t cfg_shift = ((timer_id - 16u) * 2u);
-    cfg |= (0x2u << cfg_shift);  /* Edge-triggered */
+    cfg |= (0x2u << cfg_shift);
     mmio_write32(cfg_reg, cfg);
     
-    uart_puts("[GIC] Timer interrupt 27 configured: priority, enabled, edge-triggered\n");
+    uart_puts("[GIC] Timer interrupt 27 configured\n");
     
-    uart_puts("[GIC] armv8-style GIC initialization completed\n");
+    /* Phase 3: CPU interface system register initialization */
+    uart_puts("[GIC] Phase 3: CPU interface initialization\n");
+    gic_cpu_sys_reg_init();
+    
+    uart_puts("[GIC] Complete GICv3 initialization finished\n");
 }
 
 uint32_t gic_acknowledge(void)
 {
     uint64_t int_id;
-    __asm__ volatile("mrs %0, ICC_IAR1_EL1" : "=r"(int_id));
+    __asm__ volatile("mrs %0, S3_0_c12_c12_0" : "=r"(int_id));  /* ICC_IAR1_EL1 */
     return (uint32_t)int_id;
 }
 
 void gic_end_interrupt(uint32_t int_id)
 {
-    uint64_t value = (uint64_t)int_id;
-    __asm__ volatile("msr ICC_EOIR1_EL1, %0" :: "r"(value));
-    __asm__ volatile("msr ICC_DIR_EL1, %0" :: "r"(value));
+    __asm__ volatile("msr S3_0_c12_c12_1, %x0" :: "rZ"((uint64_t)int_id));  /* ICC_EOIR1_EL1 */
+    __asm__ volatile("isb");
+    __asm__ volatile("msr S3_0_c12_c11_1, %x0" :: "rZ"((uint64_t)int_id));  /* ICC_DIR_EL1 */
+    __asm__ volatile("isb");
 }
