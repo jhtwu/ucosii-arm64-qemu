@@ -15,8 +15,11 @@ enum arch_timer_reg {
 #define ARCH_TIMER_VIRT_ACCESS      1
 
 #define ARCH_TIMER_CTRL_ENABLE      (1 << 0)
-#define ARCH_TIMER_CTRL_IT_MASK     (1 << 1)
+#define ARCH_TIMER_CTRL_IT_MASK     (1 << 1)  /* Interrupt mask bit */
 #define ARCH_TIMER_CTRL_IT_STAT     (1 << 2)
+
+/* Make sure timer is enabled with interrupt unmasked */
+#define ARCH_TIMER_CTRL_ENABLED_UNMASKED  (ARCH_TIMER_CTRL_ENABLE)
 
 #ifndef BSP_OS_TMR_PRESCALE
 #define BSP_OS_TMR_PRESCALE         10u   /* Default prescale (tick_rate / 10) */
@@ -43,13 +46,17 @@ static inline void arch_timer_reg_write_cp15(int access, enum arch_timer_reg reg
 }
 
 /*
- * Virtual timer reload function
+ * Virtual timer reload function - ensure timer stays enabled and unmasked
  */
 static inline void BSP_OS_VirtTimerReload(void)
 {
     uint32_t reload = BSP_OS_TmrReload;
     if (reload != 0u) {
+        /* Set timer value */
         __asm__ volatile("msr cntv_tval_el0, %0" :: "r"(reload));
+        
+        /* Ensure timer stays enabled and unmasked */
+        __asm__ volatile("msr cntv_ctl_el0, %0" :: "r"(ARCH_TIMER_CTRL_ENABLED_UNMASKED));
     }
 }
 
@@ -60,15 +67,17 @@ void BSP_OS_TmrTickHandler(uint32_t cpu_id)
 {
     (void)cpu_id;
     
-    uart_puts("[TIMER] BSP_OS_TmrTickHandler called\n");
+    uart_puts("[TIMER] Entry\n");
     
-    /* Critical: Reload timer FIRST to ensure continuous interrupts */
+    /* CRITICAL: Reload timer FIRST */
     BSP_OS_VirtTimerReload();
-    uart_puts("[TIMER] Timer reloaded for next interrupt\n");
+    uart_puts("[TIMER] Reloaded\n");
     
-    /* Drive µC/OS-II scheduler */
+    /* Drive µC/OS-II scheduler - this may cause context switch */
     OSTimeTick();
-    uart_puts("[TIMER] OSTimeTick() called\n");
+    uart_puts("[TIMER] OSTimeTick done\n");
+    
+    uart_puts("[TIMER] Exit\n");
 }
 
 /*
@@ -102,8 +111,10 @@ void BSP_OS_TmrTickInit(uint32_t tick_rate)
     uart_write_dec(reload);
     uart_putc('\n');
     
-    uart_puts("[BSP_OS] Enabling virtual timer with arch_timer_reg_write_cp15\n");
-    arch_timer_reg_write_cp15(ARCH_TIMER_VIRT_ACCESS, ARCH_TIMER_REG_CTRL, ARCH_TIMER_CTRL_ENABLE);
+    uart_puts("[BSP_OS] Enabling virtual timer with unmasked interrupts\n");
+    
+    /* Enable timer with interrupt unmasked - critical for continuous operation */
+    arch_timer_reg_write_cp15(ARCH_TIMER_VIRT_ACCESS, ARCH_TIMER_REG_CTRL, ARCH_TIMER_CTRL_ENABLED_UNMASKED);
     BSP_OS_VirtTimerReload();
     
     uart_puts("[BSP_OS] Timer initialized and running\n");
