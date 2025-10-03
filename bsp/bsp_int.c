@@ -52,13 +52,6 @@ void BSP_IntSrcDis(uint32_t int_id)
 void BSP_IntHandler(uint32_t int_id)
 {
     if (int_id < MAX_INTERRUPTS && bsp_int_vect_tbl[int_id] != NULL) {
-        uart_puts("[BSP] Dispatching ISR for interrupt ");
-        uart_write_dec(int_id);
-        uart_putc('\n');
         bsp_int_vect_tbl[int_id](int_id);
-    } else {
-        uart_puts("[BSP] No ISR registered for interrupt ");
-        uart_write_dec(int_id);
-        uart_putc('\n');
     }
 }

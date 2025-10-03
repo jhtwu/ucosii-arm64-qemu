@@ -48,11 +48,30 @@
     stp     x4,  x3,  [sp, #(CTX_X30 + 208)]
     stp     x2,  x1,  [sp, #(CTX_X30 + 224)]
     str     x0,         [sp, #(CTX_X30 + 240)]
-    mrs     x0, daif
-    and     x0, x0, #0x3C0
-    mov     x1, #0x5
-    orr     x0, x0, x1
+.endm
+
+/*
+ * 中文：SAVE_SPSR_FROM_IRQ 從 SPSR_EL1 保存（用於中斷上下文）
+ * English: SAVE_SPSR_FROM_IRQ saves from SPSR_EL1 (for interrupt context)
+ */
+.macro SAVE_SPSR_FROM_IRQ
+    /* Save SPSR_EL1 (contains original PSTATE before IRQ) */
+    mrs     x0, spsr_el1
     str     x0, [sp, #CTX_SPSR]
+    /* Save ELR_EL1 (return address) */
+    mrs     x0, elr_el1
+    str     x0, [sp, #CTX_ELR]
+.endm
+
+/*
+ * 中文：SAVE_SPSR_FOR_TASK_SW 設定 SPSR 為任務層面值（用於主動切換）
+ * English: SAVE_SPSR_FOR_TASK_SW sets SPSR for task-level (for voluntary switch)
+ */
+.macro SAVE_SPSR_FOR_TASK_SW
+    /* Set SPSR for EL1h mode with IRQs enabled */
+    mov     x0, #0x00000205              /* EL1h, IRQ/FIQ unmasked */
+    str     x0, [sp, #CTX_SPSR]
+    /* Save return address (LR) */
     mov     x0, x30
     str     x0, [sp, #CTX_ELR]
 .endm
@@ -108,6 +127,7 @@ OSStartHighRdy:
 
 OSCtxSw:
     SAVE_CONTEXT
+    SAVE_SPSR_FOR_TASK_SW       /* Manual SPSR setup for task-level switch */
 
     ldr     x0, =OSTCBCur
     ldr     x1, [x0]
@@ -129,13 +149,93 @@ OSCtxSw:
 
     RESTORE_AND_ERET
 
+/*
+ * 中文：OSIntCtxSw 在中斷結束時從 OSIntExit 調用，如果需要切換到更高優先級的任務。
+ *       關鍵：只更新 TCB 指針，不做實際的堆疊切換和恢復（這在 IRQ handler 中處理）
+ * English: OSIntCtxSw is called from OSIntExit when an interrupt completes and a higher priority
+ *          task is ready. Key: Only update TCB pointers, actual stack switch and restore happens
+ *          in the IRQ handler after OSIntExit returns.
+ */
 OSIntCtxSw:
-    b       OSCtxSw
+    /* 更新 OSPrioCur = OSPrioHighRdy */
+    ldr     x0, =OSPrioCur
+    ldr     x1, =OSPrioHighRdy
+    ldrb    w2, [x1]
+    strb    w2, [x0]
 
+    /* 更新 OSTCBCur = OSTCBHighRdy */
+    ldr     x0, =OSTCBCur
+    ldr     x1, =OSTCBHighRdy
+    ldr     x2, [x1]
+    str     x2, [x0]
+
+    /* 返回到 IRQ handler，它會切換堆疊並恢復新任務 */
+    /* Return to IRQ handler, which will switch stack and restore the new task */
+    ret
+
+/*
+ * 中文：ARMv8-A IRQ 異常處理程序 - 正確實現 uC/OS-II 中斷處理
+ * English: ARMv8-A IRQ Exception Handler - Proper uC/OS-II interrupt handling
+ *
+ * 實現要點 (Key Implementation Points):
+ * 1. 管理 OSIntNesting 計數器
+ * 2. 第一層中斷：保存任務上下文並切換到異常堆疊
+ * 3. 調用中斷分派函數 (irq_dispatch)
+ * 4. 調用 OSIntExit() 進行任務重新排程
+ * 5. 恢復任務上下文 (可能切換到新任務)
+ */
     .global OS_CPU_ARM_ExceptIrqHndlr
 OS_CPU_ARM_ExceptIrqHndlr:
+    /* 保存所有寄存器到當前堆疊 (任務或異常堆疊) */
+    /* Save all registers to current stack (task or exception stack) */
     SAVE_CONTEXT
+    SAVE_SPSR_FROM_IRQ          /* Save actual SPSR_EL1 from IRQ exception */
+
+    /* 增加中斷嵌套計數器 OSIntNesting++ */
+    /* Increment interrupt nesting counter */
+    ldr     x0, =OSIntNesting
+    ldrb    w1, [x0]
+    add     w1, w1, #1
+    strb    w1, [x0]
+
+    /* 檢查是否為第一層中斷 (OSIntNesting == 1) */
+    /* Check if this is the first-level interrupt */
+    cmp     w1, #1
+    bne     OS_CPU_ARM_ExceptIrqHndlr_NestedInt
+
+    /* 第一層中斷：保存任務堆疊指針並切換到異常堆疊 */
+    /* First-level interrupt: save task stack pointer and switch to exception stack */
+    ldr     x0, =OSTCBCur           /* Get current task TCB */
+    ldr     x1, [x0]
+    mov     x2, sp                   /* Save current SP (task stack) */
+    str     x2, [x1]
+
+    /* 切換到異常堆疊 */
+    /* Switch to exception stack */
+    ldr     x0, =OS_CPU_ExceptStkBase
+    ldr     x1, [x0]
+    mov     sp, x1
+
+OS_CPU_ARM_ExceptIrqHndlr_NestedInt:
+    /* 調用中斷分派函數 */
+    /* Call interrupt dispatch function */
     bl      irq_dispatch
+
+    /* 調用 OSIntExit - 處理任務排程 */
+    /* Call OSIntExit - handles task scheduling */
+    /* 注意：如果需要切換任務，OSIntExit 會調用 OSIntCtxSw，然後 OSIntCtxSw 會切換堆疊並 ERET */
+    /* Note: If task switch is needed, OSIntExit calls OSIntCtxSw, which switches stack and ERETurns */
+    bl      OSIntExit
+
+    /* OSIntExit 返回後，恢復任務堆疊 (可能已經被 OSIntCtxSw 切換到新任務) */
+    /* After OSIntExit returns, restore task stack (may have been switched by OSIntCtxSw) */
+    ldr     x0, =OSTCBCur
+    ldr     x1, [x0]
+    ldr     x2, [x1]
+    mov     sp, x2
+
+    /* 恢復任務上下文並返回 */
+    /* Restore task context and return */
     RESTORE_AND_ERET
 
     .end

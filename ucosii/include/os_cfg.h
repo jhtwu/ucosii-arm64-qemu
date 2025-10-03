@@ -21,7 +21,7 @@
 #define OS_SCHED_LOCK_EN          1u
 
 #define OS_TICK_STEP_EN           0u
-#define OS_TICKS_PER_SEC        100u
+#define OS_TICKS_PER_SEC        1000u   /* Match timer frequency: 1000 Hz */
 
 #define OS_TLS_TBL_SIZE           0u
 

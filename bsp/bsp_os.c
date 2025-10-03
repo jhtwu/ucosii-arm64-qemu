@@ -18,8 +18,8 @@ enum arch_timer_reg {
 #define ARCH_TIMER_CTRL_IT_MASK     (1 << 1)  /* Interrupt mask bit */
 #define ARCH_TIMER_CTRL_IT_STAT     (1 << 2)
 
-/* Make sure timer is enabled with interrupt unmasked */
-#define ARCH_TIMER_CTRL_ENABLED_UNMASKED  (ARCH_TIMER_CTRL_ENABLE)
+/* Make sure timer is enabled WITHOUT interrupt mask - critical for periodic operation */
+#define ARCH_TIMER_CTRL_ENABLED_UNMASKED  (ARCH_TIMER_CTRL_ENABLE)  /* Only enable bit, no mask */
 
 #ifndef BSP_OS_TMR_PRESCALE
 #define BSP_OS_TMR_PRESCALE         10u   /* Default prescale (tick_rate / 10) */
@@ -46,21 +46,15 @@ static inline void arch_timer_reg_write_cp15(int access, enum arch_timer_reg reg
 }
 
 /*
- * Virtual timer reload function - ensure timer stays enabled and unmasked
+ * Virtual timer reload function - CRITICAL: Must ensure continuous operation
  */
 static inline void BSP_OS_VirtTimerReload(void)
 {
     uint32_t reload = BSP_OS_TmrReload;
     if (reload != 0u) {
-        /* Set timer value */
-        __asm__ volatile("msr cntv_tval_el0, %0" :: "r"(reload));
-        
-        /* CRITICAL: Ensure timer stays enabled and unmasked after reload */
-        __asm__ volatile("msr cntv_ctl_el0, %0" :: "r"(ARCH_TIMER_CTRL_ENABLED_UNMASKED));
-        
-        uart_puts("[TIMER] Reloaded with value ");
-        uart_write_dec(reload);
-        uart_putc('\n');
+        /* Set new timer value for next interrupt */
+        /* Timer remains enabled automatically, no need to touch control register */
+        __asm__ volatile("msr cntv_tval_el0, %0" :: "rZ"(reload));
     }
 }
 
@@ -69,17 +63,21 @@ static inline void BSP_OS_VirtTimerReload(void)
  */
 void BSP_OS_TmrTickHandler(uint32_t cpu_id)
 {
+    static uint32_t tick_count = 0;
     (void)cpu_id;
-    
-    uart_puts("[TIMER] *** INTERRUPT TRIGGERED *** Entry\n");
-    
-    /* CRITICAL: Reload timer IMMEDIATELY */
+
+    tick_count++;
+    if ((tick_count % 1000) == 0) {
+        uart_puts("[TICK] ");
+        uart_write_dec(tick_count / 1000);
+        uart_puts("s\n");
+    }
+
+    /* CRITICAL: Reload timer FIRST for next interrupt */
     BSP_OS_VirtTimerReload();
-    
-    /* Drive µC/OS-II scheduler - this may cause context switch */
+
+    /* Drive µC/OS-II scheduler */
     OSTimeTick();
-    
-    uart_puts("[TIMER] *** INTERRUPT COMPLETE *** Exit\n");
 }
 
 /*

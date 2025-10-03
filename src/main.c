@@ -32,84 +32,31 @@ static OS_STK task_b_stack[TASK_STACK_SIZE];
 static void task_a(void *p_arg)
 {
     (void)p_arg;
+    uint32_t counter = 0u;
 
-    uart_puts("[TASK A] Starting Task A\n");
-    
-    /*
-     * 中文：初始化timer在第一個任務中，確保多任務已經開始
-     * English: Initialize timer in first task to ensure multitasking has started
-     */
-    
-    /* Configure CNTKCTL_EL1 like armv8 project */
-    uart_puts("[TASK A] Configuring CNTKCTL_EL1...\n");
+    uart_puts("[TASK A] Starting\n");
+
+    /* Configure CNTKCTL_EL1 for timer access */
     uint64_t val = 0x2;
     __asm__ volatile("msr cntkctl_el1, %0" :: "r"(val));
     val = 0xd6;
     __asm__ volatile("msr cntkctl_el1, %0" :: "r"(val));
-    uart_puts("[TASK A] CNTKCTL_EL1 configured\n");
-    
-    /* Register BSP interrupt handler for timer */
-    uart_puts("[TASK A] Registering timer interrupt handler...\n");
+
+    /* Register and initialize timer */
     BSP_IntVectSet(27u, 0u, 0u, BSP_OS_TmrTickHandler);
     BSP_IntSrcEn(27u);
-    uart_puts("[TASK A] Timer interrupt handler registered\n");
-    
-    /* Initialize timer using BSP OS function like armv8 */
-    uart_puts("[TASK A] Initializing BSP OS timer...\n");
-    BSP_OS_TmrTickInit(1000u);  /* 1000 Hz like armv8 */
-    uart_puts("[TASK A] BSP OS timer initialized\n");
-    
-    /* Resume Task B to enable multitasking */
-    uart_puts("[TASK A] Resuming Task B for timer-based multitasking\n");
-    INT8U resume_err = OSTaskResume(TASK_B_PRIO);
-    uart_puts("[TASK A] Task B resume result: ");
-    uart_write_dec(resume_err);
-    uart_putc('\n');
-    
-    /* Test: Force a short timer interrupt to verify interrupt system works */
-    uart_puts("[TASK A] Testing software interrupt (SGI) first\n");
-    
-    /* Test if our interrupt handling works by generating a software interrupt */
-    uart_puts("[TASK A] Generating SGI interrupt 1\n");
-    
-    /* Generate SGI 1 to self */
-    uint64_t sgi_val = (0ull << 24) | (1ull << 16) | 1u;  /* SGI 1 */
-    __asm__ volatile("msr ICC_SGI1R_EL1, %0" :: "r"(sgi_val));
-    
-    uart_puts("[TASK A] SGI sent, waiting for interrupt...\n");
-    for (volatile int i = 0; i < 1000000; i++);
-    
-    uart_puts("[TASK A] After SGI test\n");
-    
-    uart_puts("[TASK A] Now testing timer interrupt\n");
-    
-    /* Force an immediate virtual timer interrupt by setting tval to 1 */
-    __asm__ volatile("msr cntv_tval_el0, %0" :: "r"(1u));
-    __asm__ volatile("msr cntv_ctl_el0, %0" :: "r"(1u));  /* Enable */
-    
-    uart_puts("[TASK A] Timer interrupt should fire immediately\n");
-    for (volatile int i = 0; i < 10000000; i++);
-    
-    uart_puts("[TASK A] After timer test\n");
+    BSP_OS_TmrTickInit(1000u);
 
-    uint32_t counter = 0u;
+    uart_puts("[TASK A] Timer initialized, starting loop\n\n");
 
-    /*
-     * Test preemptive multitasking with timer interrupts during busy loop
-     */
+    /* Main loop - print every second */
     for (;;) {
-        uart_puts("[TASK A] Running - Counter: ");
-        uart_write_dec(counter);
-        uart_puts(" (busy loop)\n");
-        ++counter;
+        uart_puts("[TASK A] Counter: ");
+        uart_write_dec(counter++);
+        uart_puts("\n");
 
-        /* Shorter busy wait to allow more timer interrupts */
-        for (volatile int i = 0; i < 1000000; i++) {
-            /* Check if we get timer interrupt during busy wait */
-            if (i % 500000 == 0) {
-                uart_puts("[TASK A] Mid-loop checkpoint\n");
-            }
-        }
+        /* Delay 1 second */
+        OSTimeDlyHMSM(0, 0, 1, 0);
     }
 }
 
@@ -118,18 +65,15 @@ static void task_b(void *p_arg)
     (void)p_arg;
     uint32_t counter = 0u;
 
-    uart_puts("[TASK B] Starting Task B\n");
+    uart_puts("[TASK B] Starting\n\n");
 
-    /*
-     * Main task loop - print every second with timer-based context switching
-     */
+    /* Main loop - print every second */
     for (;;) {
-        uart_puts("[TASK B] Running - Counter: ");
-        uart_write_dec(counter);
-        uart_puts(" (0.5s delay)\n");
-        ++counter;
+        uart_puts("[TASK B] Counter: ");
+        uart_write_dec(counter++);
+        uart_puts("\n");
 
-        /* Delay for 1 second - this allows timer interrupt to switch back to Task A */
+        /* Delay 1 second */
         OSTimeDlyHMSM(0, 0, 1, 0);
     }
 }
@@ -176,10 +120,9 @@ int main(void)
         return 1;
     }
 
-    err = OSTaskSuspend(TASK_B_PRIO);
-    uart_puts("[BOOT] Task B suspended initially, err = ");
-    uart_write_dec(err);
-    uart_puts("\n");
+    /* Don't suspend Task B - let both tasks run */
+    /* err = OSTaskSuspend(TASK_B_PRIO); */
+    uart_puts("[BOOT] Task B NOT suspended - both tasks will run\n");
 
     /* Enable IRQs and test timer interrupt */
     uart_puts("[BOOT] Current DAIF = ");
