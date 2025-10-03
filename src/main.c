@@ -59,6 +59,10 @@ static void task_a(void *p_arg)
     BSP_OS_TmrTickInit(1000u);  /* 1000 Hz like armv8 */
     uart_puts("[TASK A] BSP OS timer initialized\n");
     
+    /* Resume Task B to enable multitasking */
+    uart_puts("[TASK A] Resuming Task B for timer-based multitasking\n");
+    OSTaskResume(TASK_B_PRIO);
+    
     /* Test: Force a short timer interrupt to verify interrupt system works */
     uart_puts("[TASK A] Testing software interrupt (SGI) first\n");
     
@@ -88,56 +92,37 @@ static void task_a(void *p_arg)
     uint32_t counter = 0u;
 
     /*
-     * 中文：Task A 會列印計數值，執行短暫忙等待，接著喚醒 Task B 並自行掛起。
-     * English: Task A prints its counter, performs a short busy wait, wakes Task B, then suspends itself.
+     * Timer-based context switching - both tasks run and timer interrupts cause switching
      */
     for (;;) {
-        if (ENABLE_TASK_LOG) {
-            uart_putc('A');
-            uart_putc(':');
-            uart_putc(' ');
-            uart_write_dec(counter);
-            uart_putc('\n');
-        }
+        uart_puts("[TASK A] Running - Counter: ");
+        uart_write_dec(counter);
+        uart_puts(" (0.5s delay)\n");
         ++counter;
 
-        OSTimeDlyHMSM(0, 0, 0, 10);
-
-        INT8U err;
-        OSSchedLock();
-        err = OSTaskResume(TASK_B_PRIO);
-        err = OSTaskSuspend(OS_PRIO_SELF);
-        OSSchedUnlock();
+        /* Delay for 0.5 second - shorter delay to see more frequent switching */
+        OSTimeDlyHMSM(0, 0, 0, 500);
     }
 }
 
 static void task_b(void *p_arg)
 {
     (void)p_arg;
-
     uint32_t counter = 0u;
 
+    uart_puts("[TASK B] Starting Task B\n");
+
     /*
-     * 中文：Task B 的行為與 Task A 對稱，同樣列印後喚醒對方並自行掛起，形成交錯輸出。
-     * English: Task B mirrors Task A—printing, delaying, waking the peer, and suspending, producing the alternation.
+     * Main task loop - print every second with timer-based context switching
      */
     for (;;) {
-        if (ENABLE_TASK_LOG) {
-            uart_putc('B');
-            uart_putc(':');
-            uart_putc(' ');
-            uart_write_dec(counter);
-            uart_putc('\n');
-        }
+        uart_puts("[TASK B] Running - Counter: ");
+        uart_write_dec(counter);
+        uart_puts(" (0.5s delay)\n");
         ++counter;
 
-        OSTimeDlyHMSM(0, 0, 0, 10);
-
-        INT8U err;
-        OSSchedLock();
-        err = OSTaskResume(TASK_A_PRIO);
-        err = OSTaskSuspend(OS_PRIO_SELF);
-        OSSchedUnlock();
+        /* Delay for 1 second - this allows timer interrupt to switch back to Task A */
+        OSTimeDlyHMSM(0, 0, 1, 0);
     }
 }
 
@@ -184,7 +169,7 @@ int main(void)
     }
 
     err = OSTaskSuspend(TASK_B_PRIO);
-    uart_puts("[BOOT] Task B suspend err = ");
+    uart_puts("[BOOT] Task B suspended initially, err = ");
     uart_write_dec(err);
     uart_puts("\n");
 
