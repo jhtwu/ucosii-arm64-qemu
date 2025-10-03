@@ -61,7 +61,10 @@ static void task_a(void *p_arg)
     
     /* Resume Task B to enable multitasking */
     uart_puts("[TASK A] Resuming Task B for timer-based multitasking\n");
-    OSTaskResume(TASK_B_PRIO);
+    INT8U resume_err = OSTaskResume(TASK_B_PRIO);
+    uart_puts("[TASK A] Task B resume result: ");
+    uart_write_dec(resume_err);
+    uart_putc('\n');
     
     /* Test: Force a short timer interrupt to verify interrupt system works */
     uart_puts("[TASK A] Testing software interrupt (SGI) first\n");
@@ -92,16 +95,16 @@ static void task_a(void *p_arg)
     uint32_t counter = 0u;
 
     /*
-     * Timer-based context switching - both tasks run and timer interrupts cause switching
+     * Test basic task execution with busy loops (no OS delays)
      */
     for (;;) {
         uart_puts("[TASK A] Running - Counter: ");
         uart_write_dec(counter);
-        uart_puts(" (0.5s delay)\n");
+        uart_puts(" (busy loop)\n");
         ++counter;
 
-        /* Delay for 0.5 second - shorter delay to see more frequent switching */
-        OSTimeDlyHMSM(0, 0, 0, 500);
+        /* Busy wait instead of OS delay to see if timer interrupts cause task switching */
+        for (volatile int i = 0; i < 5000000; i++);
     }
 }
 
