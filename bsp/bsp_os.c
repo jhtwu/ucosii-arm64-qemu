@@ -62,11 +62,13 @@ void BSP_OS_TmrTickHandler(uint32_t cpu_id)
     
     uart_puts("[TIMER] BSP_OS_TmrTickHandler called\n");
     
-    /* Reload timer for next interrupt */
+    /* Critical: Reload timer FIRST to ensure continuous interrupts */
     BSP_OS_VirtTimerReload();
+    uart_puts("[TIMER] Timer reloaded for next interrupt\n");
     
     /* Drive µC/OS-II scheduler */
     OSTimeTick();
+    uart_puts("[TIMER] OSTimeTick() called\n");
 }
 
 /*
@@ -81,10 +83,12 @@ void BSP_OS_TmrTickInit(uint32_t tick_rate)
     }
     
     uint32_t cnt_freq = timer_cntfrq();
-    uint32_t eff_rate = tick_rate / BSP_OS_TMR_PRESCALE;
-    if (eff_rate == 0u) {
-        eff_rate = 1u;
-    }
+    uart_puts("[BSP_OS] Counter frequency = ");
+    uart_write_dec(cnt_freq);
+    uart_putc('\n');
+    
+    /* Use a more reasonable prescale for testing */
+    uint32_t eff_rate = tick_rate;  /* No prescale for now */
     uint32_t reload = cnt_freq / eff_rate;
     if (reload == 0u) {
         reload = 1u;
@@ -92,11 +96,15 @@ void BSP_OS_TmrTickInit(uint32_t tick_rate)
     
     BSP_OS_TmrReload = reload;
     
+    uart_puts("[BSP_OS] Effective rate = ");
+    uart_write_dec(eff_rate);
+    uart_puts(" Hz, reload = ");
+    uart_write_dec(reload);
+    uart_putc('\n');
+    
     uart_puts("[BSP_OS] Enabling virtual timer with arch_timer_reg_write_cp15\n");
     arch_timer_reg_write_cp15(ARCH_TIMER_VIRT_ACCESS, ARCH_TIMER_REG_CTRL, ARCH_TIMER_CTRL_ENABLE);
     BSP_OS_VirtTimerReload();
     
-    uart_puts("[BSP_OS] Timer configured, reload = ");
-    uart_write_dec(reload);
-    uart_putc('\n');
+    uart_puts("[BSP_OS] Timer initialized and running\n");
 }
