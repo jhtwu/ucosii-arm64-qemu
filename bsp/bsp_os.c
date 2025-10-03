@@ -55,8 +55,12 @@ static inline void BSP_OS_VirtTimerReload(void)
         /* Set timer value */
         __asm__ volatile("msr cntv_tval_el0, %0" :: "r"(reload));
         
-        /* Ensure timer stays enabled and unmasked */
+        /* CRITICAL: Ensure timer stays enabled and unmasked after reload */
         __asm__ volatile("msr cntv_ctl_el0, %0" :: "r"(ARCH_TIMER_CTRL_ENABLED_UNMASKED));
+        
+        uart_puts("[TIMER] Reloaded with value ");
+        uart_write_dec(reload);
+        uart_putc('\n');
     }
 }
 
@@ -67,17 +71,15 @@ void BSP_OS_TmrTickHandler(uint32_t cpu_id)
 {
     (void)cpu_id;
     
-    uart_puts("[TIMER] Entry\n");
+    uart_puts("[TIMER] *** INTERRUPT TRIGGERED *** Entry\n");
     
-    /* CRITICAL: Reload timer FIRST */
+    /* CRITICAL: Reload timer IMMEDIATELY */
     BSP_OS_VirtTimerReload();
-    uart_puts("[TIMER] Reloaded\n");
     
     /* Drive µC/OS-II scheduler - this may cause context switch */
     OSTimeTick();
-    uart_puts("[TIMER] OSTimeTick done\n");
     
-    uart_puts("[TIMER] Exit\n");
+    uart_puts("[TIMER] *** INTERRUPT COMPLETE *** Exit\n");
 }
 
 /*

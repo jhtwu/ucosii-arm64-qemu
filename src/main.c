@@ -95,7 +95,7 @@ static void task_a(void *p_arg)
     uint32_t counter = 0u;
 
     /*
-     * Test basic task execution with busy loops (no OS delays)
+     * Test preemptive multitasking with timer interrupts during busy loop
      */
     for (;;) {
         uart_puts("[TASK A] Running - Counter: ");
@@ -103,8 +103,13 @@ static void task_a(void *p_arg)
         uart_puts(" (busy loop)\n");
         ++counter;
 
-        /* Busy wait instead of OS delay to see if timer interrupts cause task switching */
-        for (volatile int i = 0; i < 5000000; i++);
+        /* Shorter busy wait to allow more timer interrupts */
+        for (volatile int i = 0; i < 1000000; i++) {
+            /* Check if we get timer interrupt during busy wait */
+            if (i % 500000 == 0) {
+                uart_puts("[TASK A] Mid-loop checkpoint\n");
+            }
+        }
     }
 }
 
