@@ -25,21 +25,21 @@ static inline uint64_t cntpct_read(void)
 }
 
 /*
- * Chinese: 寫入計時器比較值（cntp_tval_el0）。
- * English: Writes the timer compare value (cntp_tval_el0).
+ * Chinese: 寫入虛擬計時器比較值（cntv_tval_el0）。
+ * English: Writes the virtual timer compare value (cntv_tval_el0).
  */
-static inline void cntp_tval_write(uint64_t value)
+static inline void cntv_tval_write(uint64_t value)
 {
-    __asm__ volatile("msr cntp_tval_el0, %0" :: "r"(value));
+    __asm__ volatile("msr cntv_tval_el0, %0" :: "r"(value));
 }
 
 /*
- * Chinese: 寫入計時器控制暫存器（cntp_ctl_el0）。
- * English: Writes the timer control register (cntp_ctl_el0).
+ * Chinese: 寫入虛擬計時器控制暫存器（cntv_ctl_el0）。
+ * English: Writes the virtual timer control register (cntv_ctl_el0).
  */
-static inline void cntp_ctl_write(uint64_t value)
+static inline void cntv_ctl_write(uint64_t value)
 {
-    __asm__ volatile("msr cntp_ctl_el0, %0" :: "r"(value));
+    __asm__ volatile("msr cntv_ctl_el0, %0" :: "r"(value));
 }
 
 /*
@@ -54,9 +54,9 @@ void timer_init(uint32_t tick_hz)
         g_timer_reload = 1u;
     }
 
-    cntp_ctl_write(0u);
-    cntp_tval_write(g_timer_reload);
-    cntp_ctl_write(1u);
+    cntv_ctl_write(0u);
+    cntv_tval_write(g_timer_reload);
+    cntv_ctl_write(1u);
 }
 
 /*
@@ -65,7 +65,7 @@ void timer_init(uint32_t tick_hz)
  */
 void timer_ack(void)
 {
-    cntp_tval_write(g_timer_reload);
+    cntv_tval_write(g_timer_reload);
 }
 
 /*

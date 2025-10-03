@@ -5,8 +5,9 @@
 #include "gic.h"
 #include "timer.h"
 #include "uart.h"
+#include "bsp_int.h"
 
-#define TIMER_INTERRUPT_ID  30u
+#define TIMER_INTERRUPT_ID  27u
 #define GIC_SPURIOUS_BASE   1020u
 
 void irq_dispatch(void)
@@ -21,24 +22,14 @@ void irq_dispatch(void)
     uart_putc('\n');
 
     if (int_id >= GIC_SPURIOUS_BASE) {
+        uart_puts("[IRQ] spurious interrupt, ignoring\n");
         return;
     }
 
     OSIntEnter();
 
-    if (int_id == TIMER_INTERRUPT_ID) {
-        static uint32_t seconds = 0u;
-        timer_ack();
-        ++seconds;
-        uart_puts("[TIMER] one second tick: ");
-        uart_write_dec(seconds);
-        uart_putc('\n');
-        OSTimeTick();
-    } else {
-        uart_puts("[IRQ] unexpected source: ");
-        uart_write_dec(int_id);
-        uart_putc('\n');
-    }
+    /* Use BSP interrupt handler to dispatch */
+    BSP_IntHandler(int_id);
 
     gic_end_interrupt(raw_id);
     OSIntExit();

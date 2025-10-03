@@ -57,7 +57,8 @@ el1_entry:
         msr     spsel, #1
         ldr     x0, =_stack_top
         mov     sp, x0
-        mov     x0, #3
+        /* Initialize CNTKCTL_EL1 like armv8 - allow EL0/EL1 timer access */
+        mov     x0, #0x2
         msr     cntkctl_el1, x0
         bl      zero_bss
         ldr     x0, =vector_table
@@ -85,73 +86,44 @@ zero_done:
     .global vector_table
 vector_table:
         /* Current EL with SP0 */
-        b       default_handler
-        nop
-        nop
-        nop
-        b       default_handler
-        nop
-        nop
-        nop
-        b       default_handler
-        nop
-        nop
-        nop
-        b       default_handler
-        nop
-        nop
-        nop
+        .align 7
+        b       default_handler         /* Synchronous */
+        .align 7
+        b       default_handler         /* IRQ/vIRQ */
+        .align 7  
+        b       default_handler         /* FIQ/vFIQ */
+        .align 7
+        b       default_handler         /* SError/vSError */
+        
         /* Current EL with SPx */
-        b       default_handler
-        nop
-        nop
-        nop
-        b       OS_CPU_ARM_ExceptIrqHndlr
-        nop
-        nop
-        nop
-        b       default_handler
-        nop
-        nop
-        nop
-        b       default_handler
-        nop
-        nop
-        nop
+        .align 7
+        b       default_handler         /* Synchronous */
+        .align 7
+        b       OS_CPU_ARM_ExceptIrqHndlr  /* IRQ/vIRQ */
+        .align 7
+        b       default_handler         /* FIQ/vFIQ */ 
+        .align 7
+        b       default_handler         /* SError/vSError */
+        
         /* Lower EL using AArch64 */
-        b       default_handler
-        nop
-        nop
-        nop
-        b       OS_CPU_ARM_ExceptIrqHndlr
-        nop
-        nop
-        nop
-        b       default_handler
-        nop
-        nop
-        nop
-        b       default_handler
-        nop
-        nop
-        nop
+        .align 7
+        b       default_handler         /* Synchronous */
+        .align 7
+        b       OS_CPU_ARM_ExceptIrqHndlr  /* IRQ/vIRQ */
+        .align 7
+        b       default_handler         /* FIQ/vFIQ */
+        .align 7
+        b       default_handler         /* SError/vSError */
+        
         /* Lower EL using AArch32 */
-        b       default_handler
-        nop
-        nop
-        nop
-        b       default_handler
-        nop
-        nop
-        nop
-        b       default_handler
-        nop
-        nop
-        nop
-        b       default_handler
-        nop
-        nop
-        nop
+        .align 7
+        b       default_handler         /* Synchronous */
+        .align 7
+        b       default_handler         /* IRQ/vIRQ */
+        .align 7
+        b       default_handler         /* FIQ/vFIQ */
+        .align 7
+        b       default_handler         /* SError/vSError */
 
     .align 2
 default_handler:

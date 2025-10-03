@@ -21,7 +21,9 @@ C_SRCS := \
     ucosii/source/os_time.c \
     bsp/gic.c \
     bsp/uart.c \
-    bsp/timer.c
+    bsp/timer.c \
+    bsp/bsp_int.c \
+    bsp/bsp_os.c
 
 ASM_SRCS := \
     start.S \
@@ -49,7 +51,7 @@ clean:
 	rm -rf $(BUILD_DIR)
 
 run: $(TARGET)
-	@status=0; timeout --foreground 10s qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a53 -nographic -kernel $(TARGET) 2>&1 || status=$$?; \
+	@status=0; timeout --foreground 10s qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a57 -nographic -kernel $(TARGET) 2>&1 || status=$$?; \
 	 if [ $$status -eq 124 ]; then echo "[INFO] Demo stopped after 10s timeout"; fi; \
 	 if [ $$status -ne 0 ] && [ $$status -ne 124 ]; then exit $$status; fi
 

@@ -16,13 +16,15 @@
 #include "uart.h"
 #include "timer.h"
 #include "mmio.h"
+#include "bsp_int.h"
+#include "bsp_os.h"
 
 #define BUSY_DELAY          (2000u)
 #define TASK_STACK_SIZE     512u
 #define TASK_A_PRIO            3u
 #define TASK_B_PRIO            4u
 #define ENABLE_TASK_LOG        1
-#define TIMER_INTERRUPT_ID    30u
+#define TIMER_INTERRUPT_ID    27u
 
 static OS_STK task_a_stack[TASK_STACK_SIZE];
 static OS_STK task_b_stack[TASK_STACK_SIZE];
@@ -30,6 +32,58 @@ static OS_STK task_b_stack[TASK_STACK_SIZE];
 static void task_a(void *p_arg)
 {
     (void)p_arg;
+
+    uart_puts("[TASK A] Starting Task A\n");
+    
+    /*
+     * 中文：初始化timer在第一個任務中，確保多任務已經開始
+     * English: Initialize timer in first task to ensure multitasking has started
+     */
+    
+    /* Configure CNTKCTL_EL1 like armv8 project */
+    uart_puts("[TASK A] Configuring CNTKCTL_EL1...\n");
+    uint64_t val = 0x2;
+    __asm__ volatile("msr cntkctl_el1, %0" :: "r"(val));
+    val = 0xd6;
+    __asm__ volatile("msr cntkctl_el1, %0" :: "r"(val));
+    uart_puts("[TASK A] CNTKCTL_EL1 configured\n");
+    
+    /* Register BSP interrupt handler for timer */
+    uart_puts("[TASK A] Registering timer interrupt handler...\n");
+    BSP_IntVectSet(27u, 0u, 0u, BSP_OS_TmrTickHandler);
+    BSP_IntSrcEn(27u);
+    uart_puts("[TASK A] Timer interrupt handler registered\n");
+    
+    /* Initialize timer using BSP OS function like armv8 */
+    uart_puts("[TASK A] Initializing BSP OS timer...\n");
+    BSP_OS_TmrTickInit(1000u);  /* 1000 Hz like armv8 */
+    uart_puts("[TASK A] BSP OS timer initialized\n");
+    
+    /* Test: Force a short timer interrupt to verify interrupt system works */
+    uart_puts("[TASK A] Testing software interrupt (SGI) first\n");
+    
+    /* Test if our interrupt handling works by generating a software interrupt */
+    uart_puts("[TASK A] Generating SGI interrupt 1\n");
+    
+    /* Generate SGI 1 to self */
+    uint64_t sgi_val = (0ull << 24) | (1ull << 16) | 1u;  /* SGI 1 */
+    __asm__ volatile("msr ICC_SGI1R_EL1, %0" :: "r"(sgi_val));
+    
+    uart_puts("[TASK A] SGI sent, waiting for interrupt...\n");
+    for (volatile int i = 0; i < 1000000; i++);
+    
+    uart_puts("[TASK A] After SGI test\n");
+    
+    uart_puts("[TASK A] Now testing timer interrupt\n");
+    
+    /* Force an immediate virtual timer interrupt by setting tval to 1 */
+    __asm__ volatile("msr cntv_tval_el0, %0" :: "r"(1u));
+    __asm__ volatile("msr cntv_ctl_el0, %0" :: "r"(1u));  /* Enable */
+    
+    uart_puts("[TASK A] Timer interrupt should fire immediately\n");
+    for (volatile int i = 0; i < 10000000; i++);
+    
+    uart_puts("[TASK A] After timer test\n");
 
     uint32_t counter = 0u;
 
@@ -97,20 +151,12 @@ int main(void)
     uart_init();
     uart_puts("\n[BOOT] uC/OS-II ARMv8 demo starting\n");
 
-    uart_puts("[BOOT] Initialising GICv3 and timer\n");
+    uart_puts("[BOOT] Initialising GICv3\n");
     gic_init();
-    timer_init(OS_TICKS_PER_SEC);
-
-    uint64_t timer_ctl;
-    do {
-        __asm__ volatile("mrs %0, cntp_ctl_el0" : "=r"(timer_ctl));
-    } while ((timer_ctl & (1u << 2)) == 0u);
-    uart_puts("[BOOT] timer pending detected\n");
-
-    uint32_t pending = mmio_read32(0x080A2000u);
-    uart_puts("[BOOT] GICR_ISPENDR0 now = ");
-    uart_write_hex(pending);
-    uart_putc('\n');
+    uart_puts("[BOOT] GIC initialized\n");
+    
+    /* Initialize BSP interrupt system */
+    uart_puts("[BOOT] Initializing BSP interrupt system\n");
 
     OSInit();
 
@@ -142,7 +188,24 @@ int main(void)
     uart_write_dec(err);
     uart_puts("\n");
 
+    /* Enable IRQs and test timer interrupt */
+    uart_puts("[BOOT] Current DAIF = ");
+    uint64_t daif_val;
+    __asm__ volatile("mrs %0, DAIF" : "=r"(daif_val));
+    uart_write_hex((uint32_t)daif_val);
+    uart_putc('\n');
+    
+    uart_puts("[BOOT] Enabling IRQs for timer interrupt test\n");
     __asm__ volatile("msr daifclr, #0x2");
-
+    
+    uart_puts("[BOOT] IRQs enabled - timer should now work\n");
+    
+    uart_puts("[BOOT] Starting scheduler...\n");
     OSStart();
+    
+    /* Should never reach here */
+    uart_puts("[BOOT] ERROR: Returned from OSStart()!\n");
+    while (1) {
+        /* Hang */
+    }
 }
