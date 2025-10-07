@@ -18,6 +18,7 @@
 #include "mmio.h"
 #include "bsp_int.h"
 #include "bsp_os.h"
+#include "net_demo.h"
 
 #define BUSY_DELAY          (2000u)
 #define TASK_STACK_SIZE     512u
@@ -63,17 +64,11 @@ static void task_a(void *p_arg)
 static void task_b(void *p_arg)
 {
     (void)p_arg;
-    uint32_t counter = 0u;
+    uart_puts("[TASK B] Starting network demo\n");
+    net_demo_run();
+    uart_puts("[TASK B] Network demo finished\n");
 
-    uart_puts("[TASK B] Starting\n\n");
-
-    /* Main loop - print every second */
     for (;;) {
-        uart_puts("[TASK B] Counter: ");
-        uart_write_dec(counter++);
-        uart_puts("\n");
-
-        /* Delay 1 second */
         OSTimeDlyHMSM(0, 0, 1, 0);
     }
 }

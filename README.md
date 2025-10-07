@@ -25,6 +25,22 @@ make run
 
 The demo prints boot logs followed by alternating task counters. `make run` times out after 10 seconds to avoid hanging the terminal.
 
+若系統具備既有的 TAP/Bridge（例如 `qemu-lan` 連到 `br-lan`），可使用下列指令進行 VirtIO 網路測試：
+
+```bash
+sudo make run-tap
+```
+
+建議搭配 `tcpdump -ni br-lan` 觀察客體送出的 ICMP Echo Request，並以 `ping -I br-lan 192.168.1.1` 驗證客體回覆。
+
+For virtio-net testing with an existing tap/bridge (e.g., `qemu-lan` on `br-lan`):
+
+```bash
+sudo make run-tap
+```
+
+You can capture packets via `tcpdump -ni br-lan` and use `ping -I br-lan 192.168.1.1` to exercise both TX and RX paths.
+
 ## 專案結構 / Project Layout
 
 - `src/` – application entry point與任務邏輯 / application entry and task logic
