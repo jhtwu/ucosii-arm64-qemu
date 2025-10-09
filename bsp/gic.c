@@ -180,3 +180,63 @@ void gic_end_interrupt(uint32_t int_id)
     __asm__ volatile("msr S3_0_c12_c11_1, %x0" :: "rZ"((uint64_t)int_id));  /* ICC_DIR_EL1 */
     __asm__ volatile("isb");
 }
+
+void gic_enable_spi_interrupt(uint32_t int_id)
+{
+    /* SPI interrupts are ID 32 and above */
+    if (int_id < 32u) {
+        uart_puts("[GIC] Error: Invalid SPI interrupt ID\n");
+        return;
+    }
+    
+    uart_puts("[GIC] Enabling SPI interrupt ");
+    uart_write_dec(int_id);
+    uart_putc('\n');
+    
+    /* Calculate register offset for GICD_ISENABLER */
+    uint32_t reg_offset = (int_id / 32u) * 4u;
+    uint32_t bit_offset = int_id % 32u;
+    uint32_t reg_addr = GICD_BASE + 0x100u + reg_offset; /* GICD_ISENABLER base */
+    
+    uart_puts("[GIC] Writing to GICD_ISENABLER");
+    uart_write_dec(int_id / 32u);
+    uart_puts(" at 0x");
+    uart_write_hex((unsigned long)reg_addr);
+    uart_puts(", bit ");
+    uart_write_dec(bit_offset);
+    uart_putc('\n');
+    
+    /* Enable the interrupt */
+    mmio_write32(reg_addr, (1u << bit_offset));
+    
+    /* Set interrupt priority (lower value = higher priority) */
+    uint32_t prio_reg_offset = int_id * 1u; /* 8-bit per interrupt */
+    uint32_t prio_reg_addr = GICD_BASE + 0x400u + prio_reg_offset; /* GICD_IPRIORITYR base */
+    mmio_write8(prio_reg_addr, 0x80u); /* Medium priority */
+
+    /* GICv3: Route interrupt to CPU 0 using GICD_IROUTER (not GICD_ITARGETSR) */
+    /* GICD_IROUTER is 64-bit per interrupt, starting from ID 32 */
+    if (int_id >= 32u) {
+        uint32_t router_offset = (int_id - 32u) * 8u; /* 8 bytes per interrupt */
+        uint32_t router_addr_low = GICD_BASE + 0x6000u + router_offset;  /* GICD_IROUTER base */
+        uint32_t router_addr_high = router_addr_low + 4u;
+
+        /* Set to CPU 0 (MPIDR = 0) */
+        mmio_write32(router_addr_low, 0u);   /* Lower 32 bits: Aff0, Aff1, Aff2 */
+        mmio_write32(router_addr_high, 0u);  /* Upper 32 bits: Aff3, IRM */
+
+        uart_puts("[GIC] Routed to CPU 0 via GICD_IROUTER\n");
+    }
+
+    /* Set interrupt to Group 1 */
+    uint32_t group_reg_offset = (int_id / 32u) * 4u;
+    uint32_t group_bit_offset = int_id % 32u;
+    uint32_t group_reg_addr = GICD_BASE + 0x80u + group_reg_offset; /* GICD_IGROUPR base */
+    uint32_t group_val = mmio_read32(group_reg_addr);
+    group_val |= (1u << group_bit_offset);
+    mmio_write32(group_reg_addr, group_val);
+
+    uart_puts("[GIC] SPI interrupt ");
+    uart_write_dec(int_id);
+    uart_puts(" enabled\n");
+}

@@ -8,7 +8,7 @@
 #include "uart.h"
 #include "lib.h"
 
-#define NET_DEMO_POLL_DELAY_MS  10u
+#define NET_DEMO_POLL_DELAY_MS  100u  /* Reduced polling frequency for interrupt mode */
 
 /* Static addressing for tap-based demo */
 static const uint8_t g_local_ip[4] = {192u, 168u, 1u, 1u};
@@ -336,27 +336,39 @@ void net_demo_run(void)
     uint32_t echo_period = 0u;
 
     for (;;) {
-        int rc = virtio_net_poll_frame(rx_buffer, &rx_length);
-        if (rc < 0) {
-            uart_puts("[net-demo] RX error\n");
-            idle_ticks = 0u;
-        } else if (rc > 0) {
-            if (net_demo_process_frame(rx_buffer, rx_length) != 0) {
-                idle_ticks = 0u;
-                echo_period = 0u;
-            }
-        } else {
-            if (++idle_ticks >= 100u) {
-                idle_ticks = 0u;
-                net_demo_send_arp_request();
-            }
-            if (g_peer_mac_valid) {
-                if (++echo_period >= 50u) {
-                    echo_period = 0u;
-                    net_demo_send_icmp_request(icmp_sequence++);
+        /* Interrupt-only mode: only process packets when interrupt signals */
+        if (virtio_net_has_pending_rx()) {
+            /* Process all available packets when interrupt occurs */
+            while (1) {
+                int rc = virtio_net_poll_frame(rx_buffer, &rx_length);
+                if (rc < 0) {
+                    uart_puts("[net-demo] RX error\n");
+                    break;
+                } else if (rc > 0) {
+                    if (net_demo_process_frame(rx_buffer, rx_length) != 0) {
+                        idle_ticks = 0u;
+                        echo_period = 0u;
+                    }
+                } else {
+                    /* No more packets */
+                    break;
                 }
             }
-            OSTimeDlyHMSM(0u, 0u, 0u, NET_DEMO_POLL_DELAY_MS);
         }
+
+        /* Periodic tasks: send ARP requests and ICMP pings */
+        if (++idle_ticks >= 10u) {
+            idle_ticks = 0u;
+            net_demo_send_arp_request();
+        }
+        if (g_peer_mac_valid) {
+            if (++echo_period >= 5u) {
+                echo_period = 0u;
+                net_demo_send_icmp_request(icmp_sequence++);
+            }
+        }
+
+        /* Sleep to avoid busy-waiting */
+        OSTimeDlyHMSM(0u, 0u, 0u, NET_DEMO_POLL_DELAY_MS);
     }
 }

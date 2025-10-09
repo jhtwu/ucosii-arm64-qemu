@@ -19,4 +19,9 @@ int virtio_net_poll_frame(uint8_t *out_frame, size_t *out_length);
 const uint8_t *virtio_net_get_mac(void);
 void virtio_net_debug_dump_status(void);
 
+/* Interrupt mode functions */
+void virtio_net_interrupt_handler(uint32_t int_id);
+int virtio_net_has_pending_rx(void);
+void virtio_net_enable_interrupts(void);
+
 #endif /* BSP_VIRTIO_NET_H */

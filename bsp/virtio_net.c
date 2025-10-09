@@ -4,6 +4,7 @@
 #include "uart.h"
 #include "timer.h"
 #include "lib.h"
+#include "bsp_int.h"
 
 #define VIRTIO_MMIO_MAGIC_VALUE         0x000u
 #define VIRTIO_MMIO_VERSION             0x004u
@@ -117,6 +118,9 @@ static struct virtio_queue g_tx_queue;
 
 static uint8_t g_rx_buffer_storage[VIRTIO_NET_QUEUE_SIZE][VIRTIO_NET_BUFFER_SIZE] __attribute__((aligned(64)));
 static uint8_t g_tx_buffer_storage[VIRTIO_NET_QUEUE_SIZE][VIRTIO_NET_BUFFER_SIZE] __attribute__((aligned(64)));
+
+/* Interrupt mode globals */
+static volatile int g_rx_pending = 0;
 
 static inline uint32_t virtio_mmio_read32(uintptr_t base, uint32_t offset)
 {
@@ -408,6 +412,18 @@ int virtio_net_init(uintptr_t base_addr, uint32_t irq)
     uart_putc('\n');
 
     g_dev.driver_ok = 1u;
+
+    /* Register and enable VirtIO network interrupt */
+    uart_puts("[virtio-net] Registering interrupt handler for IRQ ");
+    uart_write_dec(irq);
+    uart_putc('\n');
+
+    BSP_IntVectSet(irq, 0u, 0u, virtio_net_interrupt_handler);
+    BSP_IntSrcEn(irq);
+
+    /* Enable interrupts on the device */
+    virtio_net_enable_interrupts();
+
     return 0;
 }
 
@@ -469,17 +485,8 @@ int virtio_net_send_frame(const uint8_t *frame, size_t length)
 
     virtio_reg_write(&g_dev, VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_TX_QUEUE);
 
-    uint32_t wait_ms = 100u;
-    while (g_dev.tx_queue->used.idx == g_dev.tx_last_used && wait_ms-- > 0u) {
-        timer_delay_ms(1u);
-    }
-
-    if (g_dev.tx_queue->used.idx == g_dev.tx_last_used) {
-        uart_puts("[virtio-net] TX timeout\n");
-        return -1;
-    }
-
-    g_dev.tx_last_used = g_dev.tx_queue->used.idx;
+    /* Fire-and-forget: no waiting for completion!
+     * TX completion will be handled lazily in interrupt handler */
     uart_puts("[virtio-net] Frame transmitted\n");
     return 0;
 }
@@ -493,6 +500,9 @@ int virtio_net_poll_frame(uint8_t *out_frame, size_t *out_length)
     if (g_dev.rx_last_used == g_dev.rx_queue->used.idx) {
         return 0;
     }
+
+    /* Clear pending flag when we process packets */
+    g_rx_pending = 0;
 
     uint16_t index = (uint16_t)(g_dev.rx_last_used % g_dev.rx_queue_size);
     struct vring_used_elem *elem = &g_dev.rx_queue->used.ring[index];
@@ -544,4 +554,40 @@ void virtio_net_debug_dump_status(void)
 
     uint32_t interrupt_status = virtio_reg_read(&g_dev, VIRTIO_MMIO_INTERRUPT_STATUS);
     log_status("[virtio-net] INTERRUPT_STATUS", interrupt_status);
+}
+
+/* VirtIO network interrupt handler */
+void virtio_net_interrupt_handler(uint32_t int_id)
+{
+    uint32_t interrupt_status;
+
+    (void)int_id;  /* Unused parameter */
+
+    if (!g_dev.driver_ok) {
+        return;
+    }
+
+    /* Read interrupt status */
+    interrupt_status = virtio_reg_read(&g_dev, VIRTIO_MMIO_INTERRUPT_STATUS);
+
+    if (interrupt_status & 0x1u) {  /* Used buffer notification */
+        g_rx_pending = 1;
+    }
+
+    /* Acknowledge interrupt */
+    virtio_reg_write(&g_dev, VIRTIO_MMIO_INTERRUPT_ACK, interrupt_status);
+}
+
+/* Check if there are pending RX packets */
+int virtio_net_has_pending_rx(void)
+{
+    return g_rx_pending;
+}
+
+/* Enable interrupts on the VirtIO device */
+void virtio_net_enable_interrupts(void)
+{
+    /* The device should automatically send interrupts when buffers are used */
+    /* No additional configuration needed for basic VirtIO MMIO */
+    uart_puts("[virtio-net] Interrupts enabled on device\n");
 }

@@ -1,5 +1,6 @@
 #include "bsp_int.h"
 #include "uart.h"
+#include "gic.h"
 #include <stddef.h>
 
 #define MAX_INTERRUPTS 256u
@@ -33,7 +34,12 @@ void BSP_IntSrcEn(uint32_t int_id)
     uart_puts("[BSP] Enabled interrupt ");
     uart_write_dec(int_id);
     uart_putc('\n');
-    /* Note: Actual interrupt enable is handled by GIC in gic.c */
+    
+    /* Enable interrupt in GIC for SPI interrupts (ID >= 32) */
+    if (int_id >= 32u) {
+        gic_enable_spi_interrupt(int_id);
+    }
+    /* Note: PPI/SGI interrupts (ID < 32) are handled differently */
 }
 
 /*

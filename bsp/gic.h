@@ -21,4 +21,10 @@ uint32_t gic_acknowledge(void);
  */
 void gic_end_interrupt(uint32_t int_id);
 
+/*
+ * Chinese: 啟用 SPI 中斷。
+ * English: Enables an SPI (Shared Peripheral Interrupt).
+ */
+void gic_enable_spi_interrupt(uint32_t int_id);
+
 #endif
