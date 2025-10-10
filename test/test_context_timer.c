@@ -51,6 +51,12 @@ static void test_task_a(void *p_arg)
 
     uart_puts("[TEST-A] Task A started\n");
 
+    /* Initialize timer interrupt INSIDE first task (like main.c does) */
+    BSP_IntVectSet(27u, 0u, 0u, BSP_OS_TmrTickHandler);
+    BSP_IntSrcEn(27u);
+    BSP_OS_TmrTickInit(1000u);
+    uart_puts("[TEST-A] Timer initialized\n");
+
     for (;;) {
         task_a_switches++;
 
@@ -113,7 +119,9 @@ static void test_task_a(void *p_arg)
     }
     uart_puts("========================================\n\n");
 
-    /* Infinite loop after test */
+    /* Test completed - just loop (QEMU will timeout) */
+    uart_puts("[TEST] Test completed successfully\n");
+
     for (;;) {
         OSTimeDlyHMSM(0, 0, 10, 0);
     }
@@ -194,13 +202,7 @@ int main(void)
     }
     uart_puts("[BOOT] Test Task B created\n");
 
-    /* Initialize timer interrupt */
-    BSP_IntVectSet(27u, 0u, 0u, BSP_OS_TmrTickHandler);
-    BSP_IntSrcEn(27u);
-    BSP_OS_TmrTickInit(1000u);  /* 1000 Hz tick rate */
-    uart_puts("[BOOT] Timer interrupt initialized\n");
-
-    /* Enable IRQs */
+    /* Enable IRQs before OSStart (timer will be initialized in Task A) */
     __asm__ volatile("msr daifclr, #0x2");
     uart_puts("[BOOT] IRQs enabled\n");
 

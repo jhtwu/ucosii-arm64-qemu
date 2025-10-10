@@ -109,10 +109,16 @@ test-timer: $(TEST1_TARGET)
 	@echo "========================================="
 	@echo "Running Test Case 1: Context Switch & Timer"
 	@echo "========================================="
-	@status=0; timeout --foreground 15s qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a57 -nographic \
-		-kernel $(TEST1_TARGET) 2>&1 || status=$$?; \
-	 if [ $$status -eq 124 ]; then echo "[INFO] Test stopped after 15s timeout"; fi; \
-	 if [ $$status -ne 0 ] && [ $$status -ne 124 ]; then exit $$status; fi
+	@output=$$(timeout --foreground 12s qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a57 -nographic \
+		-kernel $(TEST1_TARGET) 2>&1); \
+	echo "$$output"; \
+	if echo "$$output" | grep -q "\[PASS\]"; then \
+		echo ""; echo "✓ TEST PASSED"; exit 0; \
+	elif echo "$$output" | grep -q "\[FAIL\]"; then \
+		echo ""; echo "✗ TEST FAILED"; exit 1; \
+	else \
+		echo ""; echo "⚠ TEST INCOMPLETE"; exit 1; \
+	fi
 
 # Test case 2: Network TAP ping test
 $(TEST2_TARGET): $(TEST2_OBJS) boot/linker.ld
@@ -124,13 +130,20 @@ test-ping: $(TEST2_TARGET)
 	@echo "========================================="
 	@echo "Prerequisites: TAP interface 'qemu-lan' must be configured"
 	@echo "              with IP 192.168.1.103"
-	@status=0; timeout --foreground 15s qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a57 -nographic \
+	@echo ""
+	@output=$$(timeout --foreground 12s qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a57 -nographic \
 		-global virtio-mmio.force-legacy=off \
 		-netdev tap,id=net0,ifname=qemu-lan,script=no,downscript=no \
 		-device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.0 \
-		-kernel $(TEST2_TARGET) 2>&1 || status=$$?; \
-	 if [ $$status -eq 124 ]; then echo "[INFO] Test stopped after 15s timeout"; fi; \
-	 if [ $$status -ne 0 ] && [ $$status -ne 124 ]; then exit $$status; fi
+		-kernel $(TEST2_TARGET) 2>&1); \
+	echo "$$output"; \
+	if echo "$$output" | grep -q "\[PASS\]"; then \
+		echo ""; echo "✓ TEST PASSED"; exit 0; \
+	elif echo "$$output" | grep -q "\[FAIL\]"; then \
+		echo ""; echo "✗ TEST FAILED"; exit 1; \
+	else \
+		echo ""; echo "⚠ TEST INCOMPLETE"; exit 1; \
+	fi
 
 # Run all tests
 test-all: test-timer test-ping

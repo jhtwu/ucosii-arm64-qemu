@@ -320,6 +320,12 @@ static void test_network_task(void *p_arg)
 
     uart_puts("[TEST] Network test task started\n");
 
+    /* Initialize timer interrupt INSIDE first task */
+    BSP_IntVectSet(27u, 0u, 0u, BSP_OS_TmrTickHandler);
+    BSP_IntSrcEn(27u);
+    BSP_OS_TmrTickInit(1000u);
+    uart_puts("[TEST] Timer initialized\n");
+
     /* Step 1: Initialize VirtIO-net driver */
     uart_puts("[TEST] Initializing VirtIO-net driver\n");
     if (virtio_net_init(0u, 0u) != 0) {
@@ -474,6 +480,9 @@ test_end:
     }
     uart_puts("========================================\n\n");
 
+    /* Test completed */
+    uart_puts("[TEST] Test completed successfully\n");
+
     /* Task complete - idle forever */
     for (;;) {
         OSTimeDlyHMSM(0, 0, 10, 0);
@@ -509,13 +518,7 @@ int main(void)
     }
     uart_puts("[BOOT] Network test task created\n");
 
-    /* Initialize timer interrupt */
-    BSP_IntVectSet(27u, 0u, 0u, BSP_OS_TmrTickHandler);
-    BSP_IntSrcEn(27u);
-    BSP_OS_TmrTickInit(1000u);  /* 1000 Hz = 1ms tick */
-    uart_puts("[BOOT] Timer initialized (1ms tick)\n");
-
-    /* Enable IRQs */
+    /* Enable IRQs before OSStart (timer will be initialized in task) */
     __asm__ volatile("msr daifclr, #0x2");
     uart_puts("[BOOT] IRQs enabled\n");
 
