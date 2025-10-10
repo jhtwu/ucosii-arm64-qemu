@@ -10,7 +10,7 @@ CFLAGS := -Wall -Wextra -O2 -std=c99 -ffreestanding -nostdlib -nostartfiles -fno
           -fdata-sections -ffunction-sections -mcpu=cortex-a53 -MMD -MP \
           -Iinclude -Iport -Iucosii/include -Ibsp
 ASFLAGS := $(CFLAGS)
-LDFLAGS := -nostdlib -T linker.ld -Wl,-Map,$(MAP_FILE) -Wl,--gc-sections
+LDFLAGS := -nostdlib -T boot/linker.ld -Wl,-Map,$(MAP_FILE) -Wl,--gc-sections
 
 C_SRCS := \
     src/main.c \
@@ -29,13 +29,43 @@ C_SRCS := \
     bsp/virtio_net.c
 
 ASM_SRCS := \
-    start.S \
+    boot/start.S \
     port/os_cpu_a.S
 
 OBJS := $(C_SRCS:%.c=$(BUILD_DIR)/%.o) $(ASM_SRCS:%.S=$(BUILD_DIR)/%.o)
 DEPS := $(OBJS:.o=.d)
 
-.PHONY: all clean run run-tap
+# Test targets
+TEST1_TARGET := $(BUILD_DIR)/test_context_timer.elf
+TEST2_TARGET := $(BUILD_DIR)/test_network_ping.elf
+
+TEST_COMMON_SRCS := \
+    port/os_cpu_c.c \
+    port/os_cpu_a.S \
+    ucosii/source/os_core.c \
+    ucosii/source/os_task.c \
+    ucosii/source/os_time.c \
+    bsp/gic.c \
+    bsp/uart.c \
+    bsp/timer.c \
+    bsp/bsp_int.c \
+    bsp/bsp_os.c \
+    src/lib.c \
+    src/irq.c \
+    boot/start.S
+
+TEST1_SRCS := test/test_context_timer.c
+TEST2_SRCS := test/test_network_ping.c bsp/virtio_net.c
+
+TEST1_OBJS := $(TEST_COMMON_SRCS:%.c=$(BUILD_DIR)/%.o) $(TEST_COMMON_SRCS:%.S=$(BUILD_DIR)/%.o)
+TEST1_OBJS := $(filter %.o,$(TEST1_OBJS))
+TEST1_OBJS += $(TEST1_SRCS:%.c=$(BUILD_DIR)/%.o)
+
+TEST2_OBJS := $(TEST_COMMON_SRCS:%.c=$(BUILD_DIR)/%.o) $(TEST_COMMON_SRCS:%.S=$(BUILD_DIR)/%.o)
+TEST2_OBJS := $(filter %.o,$(TEST2_OBJS))
+TEST2_OBJS += $(TEST2_SRCS:%.c=$(BUILD_DIR)/%.o)
+
+.PHONY: all clean run run-tap test-timer test-ping test-all
 
 all: $(TARGET)
 
@@ -47,7 +77,7 @@ $(BUILD_DIR)/%.o: %.S
 	@mkdir -p $(dir $@)
 	$(CC) $(ASFLAGS) -c $< -o $@
 
-$(TARGET): $(OBJS) linker.ld
+$(TARGET): $(OBJS) boot/linker.ld
 	$(LD) $(CFLAGS) $(OBJS) $(LDFLAGS) -lgcc -o $@
 
 clean:
@@ -70,5 +100,43 @@ run-tap: $(TARGET)
 		-kernel $(TARGET) 2>&1 || status=$$?; \
 	 if [ $$status -eq 124 ]; then echo "[INFO] Demo stopped after 10s timeout"; fi; \
 	 if [ $$status -ne 0 ] && [ $$status -ne 124 ]; then exit $$status; fi
+
+# Test case 1: Context switch and timer validation
+$(TEST1_TARGET): $(TEST1_OBJS) boot/linker.ld
+	$(LD) $(CFLAGS) $(TEST1_OBJS) $(LDFLAGS) -lgcc -o $@
+
+test-timer: $(TEST1_TARGET)
+	@echo "========================================="
+	@echo "Running Test Case 1: Context Switch & Timer"
+	@echo "========================================="
+	@status=0; timeout --foreground 15s qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a57 -nographic \
+		-kernel $(TEST1_TARGET) 2>&1 || status=$$?; \
+	 if [ $$status -eq 124 ]; then echo "[INFO] Test stopped after 15s timeout"; fi; \
+	 if [ $$status -ne 0 ] && [ $$status -ne 124 ]; then exit $$status; fi
+
+# Test case 2: Network TAP ping test
+$(TEST2_TARGET): $(TEST2_OBJS) boot/linker.ld
+	$(LD) $(CFLAGS) $(TEST2_OBJS) $(LDFLAGS) -lgcc -o $@
+
+test-ping: $(TEST2_TARGET)
+	@echo "========================================="
+	@echo "Running Test Case 2: Network TAP Ping Test"
+	@echo "========================================="
+	@echo "Prerequisites: TAP interface 'qemu-lan' must be configured"
+	@echo "              with IP 192.168.1.103"
+	@status=0; timeout --foreground 15s qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a57 -nographic \
+		-global virtio-mmio.force-legacy=off \
+		-netdev tap,id=net0,ifname=qemu-lan,script=no,downscript=no \
+		-device virtio-net-device,netdev=net0,bus=virtio-mmio-bus.0 \
+		-kernel $(TEST2_TARGET) 2>&1 || status=$$?; \
+	 if [ $$status -eq 124 ]; then echo "[INFO] Test stopped after 15s timeout"; fi; \
+	 if [ $$status -ne 0 ] && [ $$status -ne 124 ]; then exit $$status; fi
+
+# Run all tests
+test-all: test-timer test-ping
+	@echo ""
+	@echo "========================================="
+	@echo "All tests completed"
+	@echo "========================================="
 
 -include $(DEPS)
