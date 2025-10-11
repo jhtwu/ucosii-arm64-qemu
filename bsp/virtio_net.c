@@ -6,6 +6,8 @@
 #include "lib.h"
 #include "bsp_int.h"
 
+#include <ucos_ii.h>
+
 #define VIRTIO_MMIO_MAGIC_VALUE         0x000u
 #define VIRTIO_MMIO_VERSION             0x004u
 #define VIRTIO_MMIO_DEVICE_ID           0x008u
@@ -119,8 +121,15 @@ static struct virtio_queue g_tx_queue;
 static uint8_t g_rx_buffer_storage[VIRTIO_NET_QUEUE_SIZE][VIRTIO_NET_BUFFER_SIZE] __attribute__((aligned(64)));
 static uint8_t g_tx_buffer_storage[VIRTIO_NET_QUEUE_SIZE][VIRTIO_NET_BUFFER_SIZE] __attribute__((aligned(64)));
 
-/* Interrupt mode globals */
-static volatile int g_rx_pending = 0;
+struct rx_completion_entry {
+    uint16_t desc_id;
+    uint32_t total_len;
+};
+
+static struct rx_completion_entry g_rx_completions[VIRTIO_NET_QUEUE_SIZE];
+static volatile uint16_t g_rx_completion_head = 0u;
+static volatile uint16_t g_rx_completion_tail = 0u;
+static volatile uint16_t g_rx_completion_count = 0u;
 
 static inline uint32_t virtio_mmio_read32(uintptr_t base, uint32_t offset)
 {
@@ -219,6 +228,9 @@ static void virtio_net_prepare_rx(struct virtio_net_device *dev)
     }
     queue->avail.idx = dev->rx_queue_size;
     dev->rx_last_used = 0u;
+    g_rx_completion_head = 0u;
+    g_rx_completion_tail = 0u;
+    g_rx_completion_count = 0u;
 }
 
 static void virtio_net_prepare_tx(struct virtio_net_device *dev)
@@ -234,6 +246,45 @@ static void virtio_net_prepare_tx(struct virtio_net_device *dev)
     }
     queue->avail.idx = 0u;
     dev->tx_last_used = 0u;
+}
+
+static void virtio_net_handle_rx_used(void)
+{
+    struct virtio_queue *queue = g_dev.rx_queue;
+    uint16_t queue_size = g_dev.rx_queue_size;
+    uint8_t notify_device = 0u;
+
+    while (g_dev.rx_last_used != queue->used.idx) {
+        uint16_t used_index = (uint16_t)(g_dev.rx_last_used % queue_size);
+        struct vring_used_elem *elem = &queue->used.ring[used_index];
+        uint16_t desc_id = (uint16_t)elem->id;
+
+        if (desc_id >= queue_size) {
+            uart_puts("[virtio-net] RX descriptor index out of range\n");
+            g_dev.rx_last_used++;
+            continue;
+        }
+
+        if (g_rx_completion_count >= queue_size) {
+            uart_puts("[virtio-net] RX completion queue full\n");
+            queue->avail.ring[queue->avail.idx % queue_size] = desc_id;
+            queue->avail.idx++;
+            g_dev.rx_last_used++;
+            notify_device = 1u;
+            continue;
+        }
+
+        g_rx_completions[g_rx_completion_tail].desc_id = desc_id;
+        g_rx_completions[g_rx_completion_tail].total_len = elem->len;
+        g_rx_completion_tail = (uint16_t)((g_rx_completion_tail + 1u) % queue_size);
+        g_rx_completion_count++;
+
+        g_dev.rx_last_used++;
+    }
+
+    if (notify_device != 0u) {
+        virtio_reg_write(&g_dev, VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_RX_QUEUE);
+    }
 }
 
 static int virtio_net_configure_queue(struct virtio_net_device *dev,
@@ -468,6 +519,19 @@ int virtio_net_send_frame(const uint8_t *frame, size_t length)
     }
 
     struct virtio_queue *queue = g_dev.tx_queue;
+
+    /* Reclaim completed TX descriptors before enqueueing */
+    uint16_t used_idx = queue->used.idx;
+    if (g_dev.tx_last_used != used_idx) {
+        g_dev.tx_last_used = used_idx;
+    }
+
+    uint16_t outstanding = (uint16_t)(queue->avail.idx - g_dev.tx_last_used);
+    if (outstanding >= g_dev.tx_queue_size) {
+        uart_puts("[virtio-net] TX queue full\n");
+        return -1;
+    }
+
     uint16_t idx = (uint16_t)(queue->avail.idx % g_dev.tx_queue_size);
     uint8_t *buffer = g_dev.tx_buffers[idx];
     struct virtio_net_hdr *hdr = (struct virtio_net_hdr *)buffer;
@@ -497,21 +561,24 @@ int virtio_net_poll_frame(uint8_t *out_frame, size_t *out_length)
         return -1;
     }
 
-    if (g_dev.rx_last_used == g_dev.rx_queue->used.idx) {
+    OS_CPU_SR cpu_sr;
+    uint16_t desc_id;
+    uint32_t total_len;
+
+    OS_ENTER_CRITICAL();
+    if (g_rx_completion_count == 0u) {
+        OS_EXIT_CRITICAL();
         return 0;
     }
 
-    /* Clear pending flag when we process packets */
-    g_rx_pending = 0;
-
-    uint16_t index = (uint16_t)(g_dev.rx_last_used % g_dev.rx_queue_size);
-    struct vring_used_elem *elem = &g_dev.rx_queue->used.ring[index];
-    uint32_t total_len = elem->len;
-    uint16_t desc_id = (uint16_t)elem->id;
+    desc_id = g_rx_completions[g_rx_completion_head].desc_id;
+    total_len = g_rx_completions[g_rx_completion_head].total_len;
+    g_rx_completion_head = (uint16_t)((g_rx_completion_head + 1u) % g_dev.rx_queue_size);
+    g_rx_completion_count--;
+    OS_EXIT_CRITICAL();
 
     if (desc_id >= g_dev.rx_queue_size) {
-        uart_puts("[virtio-net] RX descriptor index out of range\n");
-        g_dev.rx_last_used++;
+        uart_puts("[virtio-net] RX completion descriptor out of range\n");
         return -1;
     }
 
@@ -535,7 +602,6 @@ int virtio_net_poll_frame(uint8_t *out_frame, size_t *out_length)
 
     g_dev.rx_queue->avail.ring[g_dev.rx_queue->avail.idx % g_dev.rx_queue_size] = desc_id;
     g_dev.rx_queue->avail.idx++;
-    g_dev.rx_last_used++;
 
     virtio_reg_write(&g_dev, VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_RX_QUEUE);
 
@@ -571,7 +637,11 @@ void virtio_net_interrupt_handler(uint32_t int_id)
     interrupt_status = virtio_reg_read(&g_dev, VIRTIO_MMIO_INTERRUPT_STATUS);
 
     if (interrupt_status & 0x1u) {  /* Used buffer notification */
-        g_rx_pending = 1;
+        if (g_dev.tx_queue != NULL) {
+            g_dev.tx_last_used = g_dev.tx_queue->used.idx;
+        }
+
+        virtio_net_handle_rx_used();
     }
 
     /* Acknowledge interrupt */
@@ -581,7 +651,7 @@ void virtio_net_interrupt_handler(uint32_t int_id)
 /* Check if there are pending RX packets */
 int virtio_net_has_pending_rx(void)
 {
-    return g_rx_pending;
+    return (g_rx_completion_count > 0u) ? 1 : 0;
 }
 
 /* Enable interrupts on the VirtIO device */
