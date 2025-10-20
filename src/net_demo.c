@@ -10,12 +10,34 @@
 
 #define NET_DEMO_POLL_DELAY_MS  100u  /* Reduced polling frequency for interrupt mode */
 
-/* Static addressing for tap-based demo */
-static const uint8_t g_local_ip[4] = {192u, 168u, 1u, 1u};
-static const uint8_t g_peer_ip[4]  = {192u, 168u, 1u, 103u};
+/* Network interface configuration */
+struct net_interface {
+    virtio_net_dev_t dev;
+    uint8_t local_ip[4];
+    uint8_t peer_ip[4];
+    uint8_t peer_mac[6];
+    bool peer_mac_valid;
+    const char *name;
+};
 
-static uint8_t g_peer_mac[6];
-static bool g_peer_mac_valid = false;
+/* Static addressing for dual network interfaces */
+static struct net_interface g_lan_if = {
+    .dev = NULL,
+    .local_ip = {192u, 168u, 1u, 1u},
+    .peer_ip = {192u, 168u, 1u, 103u},
+    .peer_mac = {0},
+    .peer_mac_valid = false,
+    .name = "LAN"
+};
+
+static struct net_interface g_wan_if = {
+    .dev = NULL,
+    .local_ip = {10u, 3u, 5u, 99u},
+    .peer_ip = {10u, 3u, 5u, 103u},
+    .peer_mac = {0},
+    .peer_mac_valid = false,
+    .name = "WAN"
+};
 
 struct eth_header {
     uint8_t dest[6];
@@ -99,12 +121,12 @@ static bool ip_equals(const uint8_t *lhs, const uint8_t *rhs)
     return (util_memcmp(lhs, rhs, 4u) == 0);
 }
 
-static void net_demo_send_arp_request(void)
+static void net_demo_send_arp_request(struct net_interface *iface)
 {
     uint8_t frame[64];
     util_memset(frame, 0, sizeof(frame));
 
-    const uint8_t *mac = virtio_net_get_mac();
+    const uint8_t *mac = virtio_net_get_mac_dev(iface->dev);
     const uint8_t broadcast[6] = {0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu};
 
     struct eth_header *eth = (struct eth_header *)frame;
@@ -119,21 +141,40 @@ static void net_demo_send_arp_request(void)
     arp->plen = 4u;
     arp->oper = util_htons(1u);
     util_memcpy(arp->sha, mac, sizeof(arp->sha));
-    util_memcpy(arp->spa, g_local_ip, sizeof(arp->spa));
+    util_memcpy(arp->spa, iface->local_ip, sizeof(arp->spa));
     util_memset(arp->tha, 0, sizeof(arp->tha));
-    util_memcpy(arp->tpa, g_peer_ip, sizeof(arp->tpa));
+    util_memcpy(arp->tpa, iface->peer_ip, sizeof(arp->tpa));
 
-    uart_puts("[net-demo] Sending ARP who-has 192.168.1.103\n");
-    virtio_net_send_frame(frame, sizeof(*eth) + sizeof(*arp));
+    uart_puts("[net-demo] ");
+    uart_puts(iface->name);
+    uart_puts(": Sending ARP who-has ");
+    uart_putc((char)('0' + iface->peer_ip[0] / 100u));
+    uart_putc((char)('0' + (iface->peer_ip[0] / 10u) % 10u));
+    uart_putc((char)('0' + iface->peer_ip[0] % 10u));
+    uart_putc('.');
+    uart_putc((char)('0' + iface->peer_ip[1] / 100u));
+    uart_putc((char)('0' + (iface->peer_ip[1] / 10u) % 10u));
+    uart_putc((char)('0' + iface->peer_ip[1] % 10u));
+    uart_putc('.');
+    uart_putc((char)('0' + iface->peer_ip[2] / 100u));
+    uart_putc((char)('0' + (iface->peer_ip[2] / 10u) % 10u));
+    uart_putc((char)('0' + iface->peer_ip[2] % 10u));
+    uart_putc('.');
+    uart_putc((char)('0' + iface->peer_ip[3] / 100u));
+    uart_putc((char)('0' + (iface->peer_ip[3] / 10u) % 10u));
+    uart_putc((char)('0' + iface->peer_ip[3] % 10u));
+    uart_putc('\n');
+    virtio_net_send_frame_dev(iface->dev, frame, sizeof(*eth) + sizeof(*arp));
 }
 
-static void send_arp_reply(const struct eth_header *eth,
+static void send_arp_reply(struct net_interface *iface,
+                           const struct eth_header *eth,
                            const struct arp_packet *request)
 {
     uint8_t frame[64];
     struct eth_header *reply_eth = (struct eth_header *)frame;
     struct arp_packet *reply_arp = (struct arp_packet *)(frame + sizeof(*reply_eth));
-    const uint8_t *local_mac = virtio_net_get_mac();
+    const uint8_t *local_mac = virtio_net_get_mac_dev(iface->dev);
 
     util_memcpy(reply_eth->dest, eth->src, sizeof(reply_eth->dest));
     util_memcpy(reply_eth->src, local_mac, sizeof(reply_eth->src));
@@ -145,15 +186,18 @@ static void send_arp_reply(const struct eth_header *eth,
     reply_arp->plen = 4u;
     reply_arp->oper = util_htons(2u);
     util_memcpy(reply_arp->sha, local_mac, sizeof(reply_arp->sha));
-    util_memcpy(reply_arp->spa, g_local_ip, sizeof(reply_arp->spa));
+    util_memcpy(reply_arp->spa, iface->local_ip, sizeof(reply_arp->spa));
     util_memcpy(reply_arp->tha, request->sha, sizeof(reply_arp->tha));
     util_memcpy(reply_arp->tpa, request->spa, sizeof(reply_arp->tpa));
 
-    uart_puts("[net-demo] Replying to ARP request\n");
-    virtio_net_send_frame(frame, sizeof(*reply_eth) + sizeof(*reply_arp));
+    uart_puts("[net-demo] ");
+    uart_puts(iface->name);
+    uart_puts(": Replying to ARP request\n");
+    virtio_net_send_frame_dev(iface->dev, frame, sizeof(*reply_eth) + sizeof(*reply_arp));
 }
 
-static void send_icmp_echo_reply(const uint8_t *rx_frame, size_t length)
+static void send_icmp_echo_reply(struct net_interface *iface,
+                                  const uint8_t *rx_frame, size_t length)
 {
     if (length > VIRTIO_NET_MAX_FRAME_SIZE) {
         length = VIRTIO_NET_MAX_FRAME_SIZE;
@@ -172,7 +216,7 @@ static void send_icmp_echo_reply(const uint8_t *rx_frame, size_t length)
     }
     size_t icmp_len = payload_len - ip_header_len;
 
-    const uint8_t *local_mac = virtio_net_get_mac();
+    const uint8_t *local_mac = virtio_net_get_mac_dev(iface->dev);
     uint8_t original_src_mac[6];
     util_memcpy(original_src_mac, eth->src, sizeof(original_src_mac));
 
@@ -181,7 +225,7 @@ static void send_icmp_echo_reply(const uint8_t *rx_frame, size_t length)
 
     uint8_t src_ip[4];
     util_memcpy(src_ip, ip->src, sizeof(src_ip));
-    util_memcpy(ip->src, g_local_ip, sizeof(ip->src));
+    util_memcpy(ip->src, iface->local_ip, sizeof(ip->src));
     util_memcpy(ip->dst, src_ip, sizeof(ip->dst));
     ip->ttl = 64u;
     ip->header_checksum = 0u;
@@ -194,14 +238,17 @@ static void send_icmp_echo_reply(const uint8_t *rx_frame, size_t length)
     uint16_t icmp_checksum = checksum16(icmp, icmp_len);
     icmp->checksum = util_htons(icmp_checksum);
 
-    uart_puts("[net-demo] Replied to ICMP echo request\n");
-    virtio_net_send_frame(frame, sizeof(*eth) + payload_len);
+    uart_puts("[net-demo] ");
+    uart_puts(iface->name);
+    uart_puts(": Replied to ICMP echo request\n");
+    virtio_net_send_frame_dev(iface->dev, frame, sizeof(*eth) + payload_len);
 
     /* Restore original src MAC in case buffer reused */
     util_memcpy(eth->src, original_src_mac, sizeof(original_src_mac));
 }
 
-static int net_demo_process_frame(const uint8_t *frame, size_t length)
+static int net_demo_process_frame(struct net_interface *iface,
+                                   const uint8_t *frame, size_t length)
 {
     if (length < sizeof(struct eth_header)) {
         return 0;
@@ -216,15 +263,20 @@ static int net_demo_process_frame(const uint8_t *frame, size_t length)
         }
         const struct arp_packet *arp = (const struct arp_packet *)(frame + sizeof(*eth));
         uint16_t oper = util_ntohs(arp->oper);
-        if (oper == 1u && ip_equals(arp->tpa, g_local_ip)) {
-            send_arp_reply(eth, arp);
+        if (oper == 1u && ip_equals(arp->tpa, iface->local_ip)) {
+            send_arp_reply(iface, eth, arp);
             return 1;
         }
-        if (oper == 2u && ip_equals(arp->tpa, g_local_ip) && ip_equals(arp->spa, g_peer_ip)) {
-            uart_puts("[net-demo] Received ARP reply from peer\n");
-            util_memcpy(g_peer_mac, arp->sha, sizeof(g_peer_mac));
-            g_peer_mac_valid = true;
-            print_mac("[net-demo] Peer MAC ", g_peer_mac);
+        if (oper == 2u && ip_equals(arp->tpa, iface->local_ip) && ip_equals(arp->spa, iface->peer_ip)) {
+            uart_puts("[net-demo] ");
+            uart_puts(iface->name);
+            uart_puts(": Received ARP reply from peer\n");
+            util_memcpy(iface->peer_mac, arp->sha, sizeof(iface->peer_mac));
+            iface->peer_mac_valid = true;
+            uart_puts("[net-demo] ");
+            uart_puts(iface->name);
+            uart_puts(": Peer MAC ");
+            print_mac("", iface->peer_mac);
             return 1;
         }
         return 0;
@@ -241,7 +293,7 @@ static int net_demo_process_frame(const uint8_t *frame, size_t length)
         if (version != 4u || ihl < 5u) {
             return 0;
         }
-        if (!ip_equals(ip->dst, g_local_ip)) {
+        if (!ip_equals(ip->dst, iface->local_ip)) {
             return 0;
         }
         uint16_t total_length = util_ntohs(ip->total_length);
@@ -254,7 +306,7 @@ static int net_demo_process_frame(const uint8_t *frame, size_t length)
             const struct icmp_header *icmp = (const struct icmp_header *)((const uint8_t *)ip + ip_header_len);
             size_t icmp_len = (size_t)total_length - ip_header_len;
             if (icmp_len >= sizeof(struct icmp_header) && icmp->type == 8u) {
-                send_icmp_echo_reply(frame, sizeof(struct eth_header) + total_length);
+                send_icmp_echo_reply(iface, frame, sizeof(struct eth_header) + total_length);
                 return 1;
             }
         }
@@ -263,13 +315,13 @@ static int net_demo_process_frame(const uint8_t *frame, size_t length)
     return 0;
 }
 
-static void net_demo_send_icmp_request(uint16_t sequence)
+static void net_demo_send_icmp_request(struct net_interface *iface, uint16_t sequence)
 {
-    if (!g_peer_mac_valid) {
+    if (!iface->peer_mac_valid) {
         return;
     }
 
-    const uint8_t *local_mac = virtio_net_get_mac();
+    const uint8_t *local_mac = virtio_net_get_mac_dev(iface->dev);
     uint8_t frame[sizeof(struct eth_header) + sizeof(struct ipv4_header) + sizeof(struct icmp_header) + 16u];
 
     struct eth_header *eth = (struct eth_header *)frame;
@@ -278,7 +330,7 @@ static void net_demo_send_icmp_request(uint16_t sequence)
     uint8_t *payload = icmp->data;
     size_t payload_len = 16u;
 
-    util_memcpy(eth->dest, g_peer_mac, sizeof(eth->dest));
+    util_memcpy(eth->dest, iface->peer_mac, sizeof(eth->dest));
     util_memcpy(eth->src, local_mac, sizeof(eth->src));
     eth->type = util_htons(0x0800u);
 
@@ -291,8 +343,8 @@ static void net_demo_send_icmp_request(uint16_t sequence)
     ip->ttl = 64u;
     ip->protocol = 1u;
     ip->header_checksum = 0u;
-    util_memcpy(ip->src, g_local_ip, sizeof(ip->src));
-    util_memcpy(ip->dst, g_peer_ip, sizeof(ip->dst));
+    util_memcpy(ip->src, iface->local_ip, sizeof(ip->src));
+    util_memcpy(ip->dst, iface->peer_ip, sizeof(ip->dst));
     ip->header_checksum = util_htons(checksum16(ip, sizeof(struct ipv4_header)));
 
     icmp->type = 8u;
@@ -305,66 +357,168 @@ static void net_demo_send_icmp_request(uint16_t sequence)
     icmp->checksum = 0u;
     icmp->checksum = util_htons(checksum16(icmp, sizeof(struct icmp_header) + payload_len));
 
-    uart_puts("[net-demo] Sending ICMP echo request\n");
+    uart_puts("[net-demo] ");
+    uart_puts(iface->name);
+    uart_puts(": Sending ICMP echo request\n");
     size_t frame_len = sizeof(struct eth_header) + total_length;
-    virtio_net_send_frame(frame, frame_len);
+    virtio_net_send_frame_dev(iface->dev, frame, frame_len);
 }
 
 void net_demo_run(void)
 {
-    uart_puts("[net-demo] Initialising VirtIO net driver\n");
+    uart_puts("[net-demo] Initialising VirtIO net driver for all devices\n");
 
-    if (virtio_net_init(0u, 0u) != 0) {
+    if (virtio_net_init_all() != 0) {
         uart_puts("[net-demo] Driver initialisation failed\n");
         return;
     }
 
-    if (virtio_net_self_test_registers() != 0) {
-        uart_puts("[net-demo] Register test failed\n");
+    /* Get available device count */
+    uint32_t device_count = virtio_net_get_device_count();
+    uart_puts("[net-demo] Found ");
+    uart_putc((char)('0' + device_count));
+    uart_puts(" VirtIO net device(s)\n");
+
+    /* Assign devices to interfaces */
+    if (device_count >= 1u) {
+        g_lan_if.dev = virtio_net_get_device(0u);
+        if (g_lan_if.dev != NULL) {
+            const uint8_t *lan_mac = virtio_net_get_mac_dev(g_lan_if.dev);
+            uart_puts("[net-demo] ");
+            uart_puts(g_lan_if.name);
+            uart_puts(" interface:\n");
+            uart_puts("[net-demo]   MAC: ");
+            print_mac("", lan_mac);
+            uart_puts("[net-demo]   IP: ");
+            uart_putc((char)('0' + g_lan_if.local_ip[0] / 100u));
+            uart_putc((char)('0' + (g_lan_if.local_ip[0] / 10u) % 10u));
+            uart_putc((char)('0' + g_lan_if.local_ip[0] % 10u));
+            uart_putc('.');
+            uart_putc((char)('0' + g_lan_if.local_ip[1] / 100u));
+            uart_putc((char)('0' + (g_lan_if.local_ip[1] / 10u) % 10u));
+            uart_putc((char)('0' + g_lan_if.local_ip[1] % 10u));
+            uart_putc('.');
+            uart_putc((char)('0' + g_lan_if.local_ip[2] / 100u));
+            uart_putc((char)('0' + (g_lan_if.local_ip[2] / 10u) % 10u));
+            uart_putc((char)('0' + g_lan_if.local_ip[2] % 10u));
+            uart_putc('.');
+            uart_putc((char)('0' + g_lan_if.local_ip[3] / 100u));
+            uart_putc((char)('0' + (g_lan_if.local_ip[3] / 10u) % 10u));
+            uart_putc((char)('0' + g_lan_if.local_ip[3] % 10u));
+            uart_puts("/24\n");
+        }
     }
 
-    const uint8_t *mac = virtio_net_get_mac();
-    print_mac("[net-demo] Local MAC ", mac);
-    uart_puts("[net-demo] Local IP 192.168.1.1/24\n");
+    if (device_count >= 2u) {
+        g_wan_if.dev = virtio_net_get_device(1u);
+        if (g_wan_if.dev != NULL) {
+            const uint8_t *wan_mac = virtio_net_get_mac_dev(g_wan_if.dev);
+            uart_puts("[net-demo] ");
+            uart_puts(g_wan_if.name);
+            uart_puts(" interface:\n");
+            uart_puts("[net-demo]   MAC: ");
+            print_mac("", wan_mac);
+            uart_puts("[net-demo]   IP: ");
+            uart_putc((char)('0' + g_wan_if.local_ip[0] / 100u));
+            uart_putc((char)('0' + (g_wan_if.local_ip[0] / 10u) % 10u));
+            uart_putc((char)('0' + g_wan_if.local_ip[0] % 10u));
+            uart_putc('.');
+            uart_putc((char)('0' + g_wan_if.local_ip[1] / 100u));
+            uart_putc((char)('0' + (g_wan_if.local_ip[1] / 10u) % 10u));
+            uart_putc((char)('0' + g_wan_if.local_ip[1] % 10u));
+            uart_putc('.');
+            uart_putc((char)('0' + g_wan_if.local_ip[2] / 100u));
+            uart_putc((char)('0' + (g_wan_if.local_ip[2] / 10u) % 10u));
+            uart_putc((char)('0' + g_wan_if.local_ip[2] % 10u));
+            uart_putc('.');
+            uart_putc((char)('0' + g_wan_if.local_ip[3] / 100u));
+            uart_putc((char)('0' + (g_wan_if.local_ip[3] / 10u) % 10u));
+            uart_putc((char)('0' + g_wan_if.local_ip[3] % 10u));
+            uart_puts("/24\n");
+        }
+    }
 
-    net_demo_send_arp_request();
+    /* Send initial ARP requests for both interfaces */
+    if (g_lan_if.dev != NULL) {
+        net_demo_send_arp_request(&g_lan_if);
+    }
+    if (g_wan_if.dev != NULL) {
+        net_demo_send_arp_request(&g_wan_if);
+    }
 
     uint8_t rx_buffer[VIRTIO_NET_MAX_FRAME_SIZE];
     size_t rx_length = 0u;
     uint32_t idle_ticks = 0u;
-    uint16_t icmp_sequence = 1u;
-    uint32_t echo_period = 0u;
+    uint16_t lan_icmp_sequence = 1u;
+    uint16_t wan_icmp_sequence = 1u;
+    uint32_t lan_echo_period = 0u;
+    uint32_t wan_echo_period = 0u;
 
     for (;;) {
-        /* Interrupt-only mode: only process packets when interrupt signals */
-        if (virtio_net_has_pending_rx()) {
-            /* Process all available packets when interrupt occurs */
+        /* Poll LAN interface for packets */
+        if (g_lan_if.dev != NULL && virtio_net_has_pending_rx_dev(g_lan_if.dev)) {
             while (1) {
-                int rc = virtio_net_poll_frame(rx_buffer, &rx_length);
+                int rc = virtio_net_poll_frame_dev(g_lan_if.dev, rx_buffer, &rx_length);
                 if (rc < 0) {
-                    uart_puts("[net-demo] RX error\n");
+                    uart_puts("[net-demo] ");
+                    uart_puts(g_lan_if.name);
+                    uart_puts(": RX error\n");
                     break;
                 } else if (rc > 0) {
-                    if (net_demo_process_frame(rx_buffer, rx_length) != 0) {
+                    if (net_demo_process_frame(&g_lan_if, rx_buffer, rx_length) != 0) {
                         idle_ticks = 0u;
-                        echo_period = 0u;
+                        lan_echo_period = 0u;
                     }
                 } else {
-                    /* No more packets */
                     break;
                 }
             }
         }
 
-        /* Periodic tasks: send ARP requests and ICMP pings */
+        /* Poll WAN interface for packets */
+        if (g_wan_if.dev != NULL && virtio_net_has_pending_rx_dev(g_wan_if.dev)) {
+            while (1) {
+                int rc = virtio_net_poll_frame_dev(g_wan_if.dev, rx_buffer, &rx_length);
+                if (rc < 0) {
+                    uart_puts("[net-demo] ");
+                    uart_puts(g_wan_if.name);
+                    uart_puts(": RX error\n");
+                    break;
+                } else if (rc > 0) {
+                    if (net_demo_process_frame(&g_wan_if, rx_buffer, rx_length) != 0) {
+                        idle_ticks = 0u;
+                        wan_echo_period = 0u;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
+        /* Periodic tasks: send ARP requests for both interfaces */
         if (++idle_ticks >= 10u) {
             idle_ticks = 0u;
-            net_demo_send_arp_request();
+            if (g_lan_if.dev != NULL) {
+                net_demo_send_arp_request(&g_lan_if);
+            }
+            if (g_wan_if.dev != NULL) {
+                net_demo_send_arp_request(&g_wan_if);
+            }
         }
-        if (g_peer_mac_valid) {
-            if (++echo_period >= 5u) {
-                echo_period = 0u;
-                net_demo_send_icmp_request(icmp_sequence++);
+
+        /* Send periodic ICMP pings for LAN interface */
+        if (g_lan_if.dev != NULL && g_lan_if.peer_mac_valid) {
+            if (++lan_echo_period >= 5u) {
+                lan_echo_period = 0u;
+                net_demo_send_icmp_request(&g_lan_if, lan_icmp_sequence++);
+            }
+        }
+
+        /* Send periodic ICMP pings for WAN interface */
+        if (g_wan_if.dev != NULL && g_wan_if.peer_mac_valid) {
+            if (++wan_echo_period >= 5u) {
+                wan_echo_period = 0u;
+                net_demo_send_icmp_request(&g_wan_if, wan_icmp_sequence++);
             }
         }
 

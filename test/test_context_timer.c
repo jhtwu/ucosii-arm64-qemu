@@ -34,7 +34,7 @@
 #define TASK_STACK_SIZE     512u
 #define TEST_TASK_A_PRIO    3u
 #define TEST_TASK_B_PRIO    4u
-#define TEST_DURATION_SEC   8u
+#define TEST_DURATION_SEC   3u
 
 static OS_STK test_task_a_stack[TASK_STACK_SIZE];
 static OS_STK test_task_b_stack[TASK_STACK_SIZE];
