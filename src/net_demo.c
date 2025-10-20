@@ -80,6 +80,25 @@ struct icmp_header {
     uint8_t data[];
 } __attribute__((packed));
 
+struct tcp_header {
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint32_t seq_num;
+    uint32_t ack_num;
+    uint8_t data_offset_reserved;
+    uint8_t flags;
+    uint16_t window;
+    uint16_t checksum;
+    uint16_t urgent_ptr;
+} __attribute__((packed));
+
+struct udp_header {
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint16_t length;
+    uint16_t checksum;
+} __attribute__((packed));
+
 static void print_mac(const char *label, const uint8_t mac[6])
 {
     static const char digits[] = "0123456789ABCDEF";
@@ -112,6 +131,50 @@ static uint16_t checksum16(const void *data, size_t length)
 
     while ((sum >> 16u) != 0u) {
         sum = (sum & 0xFFFFu) + (sum >> 16u);
+    }
+
+    return (uint16_t)~sum;
+}
+
+/* TCP/UDP checksum with pseudo-header (RFC 793, RFC 768) */
+static uint16_t tcp_udp_checksum(const struct ipv4_header *ip, const void *transport_hdr, size_t transport_len)
+{
+    uint32_t sum = 0u;
+    const uint16_t *words;
+    size_t i;
+
+    /* Pseudo-header: Source IP (4 bytes) - already in network byte order in packet */
+    /* Read as 16-bit words directly from the byte array (no byte swap) */
+    words = (const uint16_t *)ip->src;
+    sum += words[0];
+    sum += words[1];
+
+    /* Pseudo-header: Destination IP (4 bytes) - already in network byte order */
+    words = (const uint16_t *)ip->dst;
+    sum += words[0];
+    sum += words[1];
+
+    /* Pseudo-header: Zero + Protocol (convert from host variable to network order) */
+    sum += util_htons((uint16_t)ip->protocol);
+
+    /* Pseudo-header: TCP/UDP Length (convert from host variable to network order) */
+    sum += util_htons((uint16_t)transport_len);
+
+    /* TCP/UDP header and data - already in network byte order in packet */
+    /* Read as 16-bit words directly (no byte swap) */
+    words = (const uint16_t *)transport_hdr;
+    for (i = 0; i < transport_len; i += 2) {
+        if (i + 1 < transport_len) {
+            sum += *words++;
+        } else {
+            /* Odd byte: pad with zero (convert to network order) */
+            sum += util_htons((uint16_t)(*(const uint8_t *)words) << 8);
+        }
+    }
+
+    /* Fold 32-bit sum to 16 bits */
+    while (sum >> 16) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
     }
 
     return (uint16_t)~sum;
@@ -168,6 +231,33 @@ static void net_demo_send_arp_request(struct net_interface *iface)
     virtio_net_send_frame_dev(iface->dev, frame, sizeof(*eth) + sizeof(*arp));
 }
 
+static void send_arp_request_for_ip(struct net_interface *iface, const uint8_t target_ip[4])
+{
+    uint8_t frame[64];
+    util_memset(frame, 0, sizeof(frame));
+
+    const uint8_t *mac = virtio_net_get_mac_dev(iface->dev);
+    const uint8_t broadcast[6] = {0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu, 0xFFu};
+
+    struct eth_header *eth = (struct eth_header *)frame;
+    util_memcpy(eth->dest, broadcast, sizeof(eth->dest));
+    util_memcpy(eth->src, mac, sizeof(eth->src));
+    eth->type = util_htons(0x0806u);
+
+    struct arp_packet *arp = (struct arp_packet *)(frame + sizeof(*eth));
+    arp->htype = util_htons(1u);
+    arp->ptype = util_htons(0x0800u);
+    arp->hlen = 6u;
+    arp->plen = 4u;
+    arp->oper = util_htons(1u);
+    util_memcpy(arp->sha, mac, sizeof(arp->sha));
+    util_memcpy(arp->spa, iface->local_ip, sizeof(arp->spa));
+    util_memset(arp->tha, 0, sizeof(arp->tha));
+    util_memcpy(arp->tpa, target_ip, sizeof(arp->tpa));
+
+    virtio_net_send_frame_dev(iface->dev, frame, sizeof(*eth) + sizeof(*arp));
+}
+
 static void send_arp_reply(struct net_interface *iface,
                            const struct eth_header *eth,
                            const struct arp_packet *request)
@@ -191,9 +281,6 @@ static void send_arp_reply(struct net_interface *iface,
     util_memcpy(reply_arp->tha, request->sha, sizeof(reply_arp->tha));
     util_memcpy(reply_arp->tpa, request->spa, sizeof(reply_arp->tpa));
 
-    uart_puts("[net-demo] ");
-    uart_puts(iface->name);
-    uart_puts(": Replying to ARP request\n");
     virtio_net_send_frame_dev(iface->dev, frame, sizeof(*reply_eth) + sizeof(*reply_arp));
 }
 
@@ -273,9 +360,11 @@ static int net_demo_process_frame(struct net_interface *iface,
         }
         const struct arp_packet *arp = (const struct arp_packet *)(frame + sizeof(*eth));
         uint16_t oper = util_ntohs(arp->oper);
-        if (oper == 1u && ip_equals(arp->tpa, iface->local_ip)) {
-            send_arp_reply(iface, eth, arp);
-            return 1;
+        if (oper == 1u) {
+            if (ip_equals(arp->tpa, iface->local_ip)) {
+                send_arp_reply(iface, eth, arp);
+                return 1;
+            }
         }
         if (oper == 2u) {
             /* Learn from ARP reply and add to cache */
@@ -311,6 +400,7 @@ static int net_demo_process_frame(struct net_interface *iface,
 
         /* Learn source IP-MAC mapping from IP packets (for NAT reverse lookup) */
         arp_cache_add(ip->src, eth->src);
+
 
         /* Check if packet is from WAN destined for our WAN IP (NAT return traffic) - HANDLE FIRST */
         if (nat_is_wan_ip(ip->dst) && iface == &g_wan_if && ip->protocol == 1u) {
@@ -372,6 +462,82 @@ static int net_demo_process_frame(struct net_interface *iface,
             }
         }
 
+        /* Check if packet is from WAN destined for our WAN IP (NAT return traffic) */
+        /* MUST be checked BEFORE "is_for_us" check, otherwise NAT return packets are dropped */
+        if (nat_is_wan_ip(ip->dst) && iface == &g_wan_if && (ip->protocol == 6u || ip->protocol == 17u)) {
+
+            uint16_t total_length = util_ntohs(ip->total_length);
+            size_t ip_header_len = (size_t)((ip->version_ihl & 0x0Fu) * 4u);
+            size_t min_transport_len = (ip->protocol == 6u) ? sizeof(struct tcp_header) : sizeof(struct udp_header);
+
+            if (total_length >= ip_header_len + min_transport_len) {
+                uint16_t wan_port, src_port;
+                uint8_t lan_ip[4];
+                uint16_t lan_port;
+
+                if (ip->protocol == 6u) {
+                    struct tcp_header *tcp = (struct tcp_header *)((uint8_t *)ip + ip_header_len);
+                    wan_port = util_ntohs(tcp->dst_port);
+                    src_port = util_ntohs(tcp->src_port);
+                } else {
+                    struct udp_header *udp = (struct udp_header *)((uint8_t *)ip + ip_header_len);
+                    wan_port = util_ntohs(udp->dst_port);
+                    src_port = util_ntohs(udp->src_port);
+                }
+
+                uint8_t proto = (ip->protocol == 6u) ? NAT_PROTO_TCP : NAT_PROTO_UDP;
+
+                /* Perform reverse NAT translation */
+                if (nat_translate_inbound(proto, wan_port,
+                                         ip->src, src_port, lan_ip, &lan_port) == 0) {
+                    /* Copy and modify the packet */
+                    uint8_t forward_frame[VIRTIO_NET_MAX_FRAME_SIZE];
+                    if (length <= VIRTIO_NET_MAX_FRAME_SIZE && g_lan_if.dev != NULL) {
+                        util_memcpy(forward_frame, frame, length);
+
+                        struct eth_header *fwd_eth = (struct eth_header *)forward_frame;
+                        struct ipv4_header *fwd_ip = (struct ipv4_header *)(forward_frame + sizeof(*fwd_eth));
+
+                        /* Update Ethernet header */
+                        const uint8_t *lan_mac = virtio_net_get_mac_dev(g_lan_if.dev);
+                        util_memcpy(fwd_eth->src, lan_mac, 6);
+
+                        /* Try to get destination MAC from ARP cache */
+                        if (!arp_cache_lookup(lan_ip, fwd_eth->dest)) {
+                            uart_puts("[NAT] LAN destination MAC not in cache, dropping packet\n");
+                            return 1;
+                        }
+
+                        /* Update IP header */
+                        util_memcpy(fwd_ip->dst, lan_ip, 4);
+                        fwd_ip->ttl--;
+                        fwd_ip->header_checksum = 0u;
+                        fwd_ip->header_checksum = util_htons(checksum16(fwd_ip, ip_header_len));
+
+                        /* Update transport port and checksum */
+                        if (ip->protocol == 6u) {
+                            struct tcp_header *fwd_tcp = (struct tcp_header *)((uint8_t *)fwd_ip + ip_header_len);
+                            fwd_tcp->dst_port = util_htons(lan_port);
+                            fwd_tcp->checksum = 0u;
+                            size_t tcp_len = total_length - ip_header_len;
+                            fwd_tcp->checksum = tcp_udp_checksum(fwd_ip, fwd_tcp, tcp_len);  /* Direct assignment */
+                        } else {
+                            struct udp_header *fwd_udp = (struct udp_header *)((uint8_t *)fwd_ip + ip_header_len);
+                            fwd_udp->dst_port = util_htons(lan_port);
+                            fwd_udp->checksum = 0u;
+                            size_t udp_len = total_length - ip_header_len;
+                            fwd_udp->checksum = tcp_udp_checksum(fwd_ip, fwd_udp, udp_len);  /* Direct assignment */
+                        }
+
+                        /* Send on LAN interface */
+                        virtio_net_send_frame_dev(g_lan_if.dev, forward_frame,
+                                                sizeof(*fwd_eth) + total_length);
+                        return 1;
+                    }
+                }
+            }
+        }
+
         /* Check if packet is destined for us (or our WAN IP on LAN interface for gateway) */
         bool is_for_us = ip_equals(ip->dst, iface->local_ip);
 
@@ -402,8 +568,8 @@ static int net_demo_process_frame(struct net_interface *iface,
             /* Check if packet is from LAN network trying to reach outside */
             if (nat_is_lan_ip(ip->src) && iface == &g_lan_if) {
 
-                /* Only forward ICMP for now */
-                if (ip->protocol == 1u && g_wan_if.dev != NULL) {
+                /* Forward ICMP, TCP, and UDP */
+                if (ip->protocol == 1u && g_wan_if.dev != NULL) {  /* ICMP */
                     uint16_t total_length = util_ntohs(ip->total_length);
                     size_t ip_header_len = (size_t)((ip->version_ihl & 0x0Fu) * 4u);
 
@@ -455,11 +621,92 @@ static int net_demo_process_frame(struct net_interface *iface,
                             }
                         }
                     }
+                } else if ((ip->protocol == 6u || ip->protocol == 17u) && g_wan_if.dev != NULL) {  /* TCP or UDP */
+                    uint16_t total_length = util_ntohs(ip->total_length);
+                    size_t ip_header_len = (size_t)((ip->version_ihl & 0x0Fu) * 4u);
+                    size_t min_transport_len = (ip->protocol == 6u) ? sizeof(struct tcp_header) : sizeof(struct udp_header);
+
+                    if (total_length >= ip_header_len + min_transport_len) {
+                        uint16_t src_port, dst_port, wan_port;
+
+                        if (ip->protocol == 6u) {
+                            struct tcp_header *tcp = (struct tcp_header *)((uint8_t *)ip + ip_header_len);
+                            src_port = util_ntohs(tcp->src_port);
+                            dst_port = util_ntohs(tcp->dst_port);
+                        } else {
+                            struct udp_header *udp = (struct udp_header *)((uint8_t *)ip + ip_header_len);
+                            src_port = util_ntohs(udp->src_port);
+                            dst_port = util_ntohs(udp->dst_port);
+                        }
+
+                        uint8_t proto = (ip->protocol == 6u) ? NAT_PROTO_TCP : NAT_PROTO_UDP;
+
+                        /* Perform NAT translation */
+                        if (nat_translate_outbound(proto, ip->src, src_port,
+                                                  ip->dst, dst_port, &wan_port) == 0) {
+                            /* Copy and modify the packet */
+                            uint8_t forward_frame[VIRTIO_NET_MAX_FRAME_SIZE];
+                            if (length <= VIRTIO_NET_MAX_FRAME_SIZE) {
+                                util_memcpy(forward_frame, frame, length);
+
+                                struct eth_header *fwd_eth = (struct eth_header *)forward_frame;
+                                struct ipv4_header *fwd_ip = (struct ipv4_header *)(forward_frame + sizeof(*fwd_eth));
+
+                                /* Update Ethernet header */
+                                const uint8_t *wan_mac = virtio_net_get_mac_dev(g_wan_if.dev);
+                                util_memcpy(fwd_eth->src, wan_mac, 6);
+
+                                /* Try to get destination MAC from ARP cache */
+                                if (!arp_cache_lookup(ip->dst, fwd_eth->dest)) {
+                                    send_arp_request_for_ip(&g_wan_if, ip->dst);
+                                    return 1;
+                                }
+
+                                /* Update IP header */
+                                util_memcpy(fwd_ip->src, g_wan_if.local_ip, 4);
+                                fwd_ip->ttl--;
+                                fwd_ip->header_checksum = 0u;
+                                fwd_ip->header_checksum = util_htons(checksum16(fwd_ip, ip_header_len));
+
+                                /* Update transport port and checksum */
+                                if (ip->protocol == 6u) {
+                                    struct tcp_header *fwd_tcp = (struct tcp_header *)((uint8_t *)fwd_ip + ip_header_len);
+                                    fwd_tcp->src_port = util_htons(wan_port);
+                                    fwd_tcp->checksum = 0u;
+                                    size_t tcp_len = total_length - ip_header_len;
+                                    fwd_tcp->checksum = tcp_udp_checksum(fwd_ip, fwd_tcp, tcp_len);
+                                } else {
+                                    struct udp_header *fwd_udp = (struct udp_header *)((uint8_t *)fwd_ip + ip_header_len);
+                                    fwd_udp->src_port = util_htons(wan_port);
+                                    fwd_udp->checksum = 0u;
+                                    size_t udp_len = total_length - ip_header_len;
+                                    fwd_udp->checksum = tcp_udp_checksum(fwd_ip, fwd_udp, udp_len);  /* Direct assignment */
+                                }
+
+                                /* Send on WAN interface */
+                                virtio_net_send_frame_dev(g_wan_if.dev, forward_frame,
+                                                        sizeof(*fwd_eth) + total_length);
+                                return 1;
+                            }
+                        }
+                    }
                 }
             }
 
             /* Check if packet is from WAN destined for our WAN IP (NAT return traffic) */
-            if (nat_is_wan_ip(ip->dst) && iface == &g_wan_if && ip->protocol == 1u) {
+            if (nat_is_wan_ip(ip->dst) && iface == &g_wan_if && (ip->protocol == 1u || ip->protocol == 6u || ip->protocol == 17u)) {
+                /* Debug: Show we're handling WAN return packet */
+                if (ip->protocol == 6u || ip->protocol == 17u) {
+                    uart_puts("[NAT] WAN return packet proto=");
+                    uart_write_dec(ip->protocol);
+                    uart_puts(" from ");
+                    uart_write_dec(ip->src[0]); uart_putc('.');
+                    uart_write_dec(ip->src[1]); uart_putc('.');
+                    uart_write_dec(ip->src[2]); uart_putc('.');
+                    uart_write_dec(ip->src[3]);
+                    uart_puts(" to WAN IP\n");
+                }
+
                 uint16_t total_length = util_ntohs(ip->total_length);
                 size_t ip_header_len = (size_t)((ip->version_ihl & 0x0Fu) * 4u);
 
@@ -505,14 +752,92 @@ static int net_demo_process_frame(struct net_interface *iface,
                                 size_t icmp_len = total_length - ip_header_len;
                                 fwd_icmp->checksum = util_htons(checksum16(fwd_icmp, icmp_len));
 
-                                uart_puts("[NAT] Forwarding ICMP reply from WAN to LAN (");
-                                uart_write_dec(lan_ip[0]); uart_putc('.');
-                                uart_write_dec(lan_ip[1]); uart_putc('.');
-                                uart_write_dec(lan_ip[2]); uart_putc('.');
-                                uart_write_dec(lan_ip[3]);
-                                uart_puts(" ID=");
-                                uart_write_dec(lan_port);
-                                uart_puts(")\n");
+                                /* Send on LAN interface */
+                                virtio_net_send_frame_dev(g_lan_if.dev, forward_frame,
+                                                        sizeof(*fwd_eth) + total_length);
+                                return 1;
+                            }
+                        }
+                    }
+                } else if (ip->protocol == 6u || ip->protocol == 17u) {  /* TCP or UDP */
+                    size_t min_transport_len = (ip->protocol == 6u) ? sizeof(struct tcp_header) : sizeof(struct udp_header);
+
+                    if (total_length >= ip_header_len + min_transport_len) {
+                        uint16_t wan_port, src_port;
+                        uint8_t lan_ip[4];
+                        uint16_t lan_port;
+
+                        if (ip->protocol == 6u) {
+                            struct tcp_header *tcp = (struct tcp_header *)((uint8_t *)ip + ip_header_len);
+                            wan_port = util_ntohs(tcp->dst_port);
+                            src_port = util_ntohs(tcp->src_port);
+                        } else {
+                            struct udp_header *udp = (struct udp_header *)((uint8_t *)ip + ip_header_len);
+                            wan_port = util_ntohs(udp->dst_port);
+                            src_port = util_ntohs(udp->src_port);
+                        }
+
+                        uint8_t proto = (ip->protocol == 6u) ? NAT_PROTO_TCP : NAT_PROTO_UDP;
+
+                        /* Perform reverse NAT translation */
+                        if (nat_translate_inbound(proto, wan_port,
+                                                 ip->src, src_port, lan_ip, &lan_port) == 0) {
+                            uart_puts("[NAT] ");
+                            uart_puts((ip->protocol == 6u) ? "TCP" : "UDP");
+                            uart_puts(" inbound: ");
+                            uart_write_dec(ip->src[0]); uart_putc('.');
+                            uart_write_dec(ip->src[1]); uart_putc('.');
+                            uart_write_dec(ip->src[2]); uart_putc('.');
+                            uart_write_dec(ip->src[3]);
+                            uart_putc(':');
+                            uart_write_dec(src_port);
+                            uart_puts(" -> ");
+                            uart_write_dec(lan_ip[0]); uart_putc('.');
+                            uart_write_dec(lan_ip[1]); uart_putc('.');
+                            uart_write_dec(lan_ip[2]); uart_putc('.');
+                            uart_write_dec(lan_ip[3]);
+                            uart_putc(':');
+                            uart_write_dec(lan_port);
+                            uart_puts(" (was WAN:");
+                            uart_write_dec(wan_port);
+                            uart_puts(")\n");
+                            /* Copy and modify the packet */
+                            uint8_t forward_frame[VIRTIO_NET_MAX_FRAME_SIZE];
+                            if (length <= VIRTIO_NET_MAX_FRAME_SIZE && g_lan_if.dev != NULL) {
+                                util_memcpy(forward_frame, frame, length);
+
+                                struct eth_header *fwd_eth = (struct eth_header *)forward_frame;
+                                struct ipv4_header *fwd_ip = (struct ipv4_header *)(forward_frame + sizeof(*fwd_eth));
+
+                                /* Update Ethernet header */
+                                const uint8_t *lan_mac = virtio_net_get_mac_dev(g_lan_if.dev);
+                                util_memcpy(fwd_eth->src, lan_mac, 6);
+
+                                /* Try to get destination MAC from ARP cache */
+                                if (!arp_cache_lookup(lan_ip, fwd_eth->dest)) {
+                                    return 1;
+                                }
+
+                                /* Update IP header */
+                                util_memcpy(fwd_ip->dst, lan_ip, 4);
+                                fwd_ip->ttl--;
+                                fwd_ip->header_checksum = 0u;
+                                fwd_ip->header_checksum = util_htons(checksum16(fwd_ip, ip_header_len));
+
+                                /* Update transport port and checksum */
+                                if (ip->protocol == 6u) {
+                                    struct tcp_header *fwd_tcp = (struct tcp_header *)((uint8_t *)fwd_ip + ip_header_len);
+                                    fwd_tcp->dst_port = util_htons(lan_port);
+                                    fwd_tcp->checksum = 0u;
+                                    size_t tcp_len = total_length - ip_header_len;
+                                    fwd_tcp->checksum = tcp_udp_checksum(fwd_ip, fwd_tcp, tcp_len);  /* Direct assignment */
+                                } else {
+                                    struct udp_header *fwd_udp = (struct udp_header *)((uint8_t *)fwd_ip + ip_header_len);
+                                    fwd_udp->dst_port = util_htons(lan_port);
+                                    fwd_udp->checksum = 0u;
+                                    size_t udp_len = total_length - ip_header_len;
+                                    fwd_udp->checksum = tcp_udp_checksum(fwd_ip, fwd_udp, udp_len);  /* Direct assignment */
+                                }
 
                                 /* Send on LAN interface */
                                 virtio_net_send_frame_dev(g_lan_if.dev, forward_frame,

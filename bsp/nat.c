@@ -506,20 +506,6 @@ void arp_cache_add(const uint8_t ip[4], const uint8_t mac[6])
     util_memcpy(entry->ip, ip, 4);
     util_memcpy(entry->mac, mac, 6);
     entry->last_update = current_time;
-
-    uart_puts("[ARP] Learned: ");
-    uart_write_dec(ip[0]); uart_putc('.');
-    uart_write_dec(ip[1]); uart_putc('.');
-    uart_write_dec(ip[2]); uart_putc('.');
-    uart_write_dec(ip[3]);
-    uart_puts(" -> ");
-    uart_write_hex(mac[0]); uart_putc(':');
-    uart_write_hex(mac[1]); uart_putc(':');
-    uart_write_hex(mac[2]); uart_putc(':');
-    uart_write_hex(mac[3]); uart_putc(':');
-    uart_write_hex(mac[4]); uart_putc(':');
-    uart_write_hex(mac[5]);
-    uart_putc('\n');
 }
 
 /**

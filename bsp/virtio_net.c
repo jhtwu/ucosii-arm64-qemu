@@ -49,7 +49,7 @@
 #define VIRTIO_NET_RX_QUEUE             0u
 #define VIRTIO_NET_TX_QUEUE             1u
 
-#define VIRTIO_NET_QUEUE_SIZE           8u
+#define VIRTIO_NET_QUEUE_SIZE           64u
 #define VIRTIO_NET_BUFFER_SIZE          2048u
 
 struct virtio_net_hdr {
@@ -571,17 +571,42 @@ int virtio_net_send_frame_dev(virtio_net_dev_t dev, const uint8_t *frame, size_t
     }
 
     struct virtio_queue *queue = dev->tx_queue;
+    uint16_t in_flight, available_slots;
 
-    /* Reclaim completed TX descriptors before enqueueing */
-    uint16_t used_idx = queue->used.idx;
-    if (dev->tx_last_used != used_idx) {
-        dev->tx_last_used = used_idx;
-    }
+    /* Check and update completed TX descriptors */
+    dev->tx_last_used = queue->used.idx;
 
-    uint16_t outstanding = (uint16_t)(queue->avail.idx - dev->tx_last_used);
-    if (outstanding >= dev->tx_queue_size) {
-        uart_puts("[virtio-net] TX queue full\n");
-        return -1;
+    /* Calculate in-flight packets (handle wrap-around) */
+    in_flight = (uint16_t)((queue->avail.idx - dev->tx_last_used) & 0xFFFFu);
+    available_slots = (uint16_t)(dev->tx_queue_size - in_flight);
+
+    /* If queue is critically full, poll for completions before giving up */
+    if (available_slots < 4u) {
+        uint16_t retries = 0u;
+        while (available_slots < 4u && retries < 100u) {
+            /* Force check the used ring again */
+            dev->tx_last_used = queue->used.idx;
+            in_flight = (uint16_t)((queue->avail.idx - dev->tx_last_used) & 0xFFFFu);
+            available_slots = (uint16_t)(dev->tx_queue_size - in_flight);
+
+            if (available_slots >= 4u) {
+                break;
+            }
+
+            retries++;
+            /* Small delay to let device process */
+            if (retries % 10u == 0u) {
+                /* Re-read used index to catch any completions */
+                dev->tx_last_used = queue->used.idx;
+                in_flight = (uint16_t)((queue->avail.idx - dev->tx_last_used) & 0xFFFFu);
+                available_slots = (uint16_t)(dev->tx_queue_size - in_flight);
+            }
+        }
+
+        if (available_slots < 2u) {
+            uart_puts("[virtio-net] TX queue full\n");
+            return -1;
+        }
     }
 
     uint16_t idx = (uint16_t)(queue->avail.idx % dev->tx_queue_size);
