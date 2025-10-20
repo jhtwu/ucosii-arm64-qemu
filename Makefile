@@ -26,7 +26,8 @@ C_SRCS := \
     bsp/timer.c \
     bsp/bsp_int.c \
     bsp/bsp_os.c \
-    bsp/virtio_net.c
+    bsp/virtio_net.c \
+    bsp/nat.c
 
 ASM_SRCS := \
     boot/start.S \
@@ -51,6 +52,7 @@ TEST_COMMON_SRCS := \
     bsp/timer.c \
     bsp/bsp_int.c \
     bsp/bsp_os.c \
+    bsp/nat.c \
     src/lib.c \
     src/irq.c \
     boot/start.S
