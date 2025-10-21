@@ -9,7 +9,11 @@
 #include "lib.h"
 #include "nat.h"
 
-#define NET_DEMO_POLL_DELAY_MS  100u  /* Reduced polling frequency for interrupt mode */
+#define NET_DEMO_ARP_INTERVAL_TICKS     (OS_TICKS_PER_SEC)
+#define NET_DEMO_PING_INTERVAL_TICKS    (OS_TICKS_PER_SEC / 2u)
+#define NET_RX_TASK_STACK_SIZE          1024u
+#define NET_LAN_RX_TASK_PRIO            5u
+#define NET_WAN_RX_TASK_PRIO            6u
 
 /* Network interface configuration */
 struct net_interface {
@@ -39,6 +43,11 @@ static struct net_interface g_wan_if = {
     .peer_mac_valid = false,
     .name = "WAN"
 };
+
+static OS_STK net_lan_rx_task_stack[NET_RX_TASK_STACK_SIZE];
+static OS_STK net_wan_rx_task_stack[NET_RX_TASK_STACK_SIZE];
+
+static void net_rx_task(void *p_arg);
 
 struct eth_header {
     uint8_t dest[6];
@@ -903,6 +912,34 @@ static void net_demo_send_icmp_request(struct net_interface *iface, uint16_t seq
     virtio_net_send_frame_dev(iface->dev, frame, frame_len);
 }
 
+static void net_rx_task(void *p_arg)
+{
+    struct net_interface *iface = (struct net_interface *)p_arg;
+    uint8_t rx_buffer[VIRTIO_NET_MAX_FRAME_SIZE];
+    size_t rx_length = 0u;
+
+    for (;;) {
+        if (iface == NULL || iface->dev == NULL) {
+            OSTimeDly(OS_TICKS_PER_SEC);
+            continue;
+        }
+
+        while (virtio_net_has_pending_rx_dev(iface->dev)) {
+            int rc = virtio_net_poll_frame_dev(iface->dev, rx_buffer, &rx_length);
+            if (rc > 0) {
+                net_demo_process_frame(iface, rx_buffer, rx_length);
+            } else if (rc < 0) {
+                break;
+            }
+        }
+
+        INT8U err = virtio_net_wait_rx_dev(iface->dev, 0u);
+        if (err != OS_ERR_NONE) {
+            OSTimeDly(1u);
+        }
+    }
+}
+
 void net_demo_run(void)
 {
     uart_puts("[net-demo] Initialising VirtIO net driver for all devices\n");
@@ -982,66 +1019,38 @@ void net_demo_run(void)
         }
     }
 
-    /* Send initial ARP requests for both interfaces */
     if (g_lan_if.dev != NULL) {
         net_demo_send_arp_request(&g_lan_if);
+        INT8U err = OSTaskCreate(net_rx_task,
+                                 (void *)&g_lan_if,
+                                 &net_lan_rx_task_stack[NET_RX_TASK_STACK_SIZE - 1u],
+                                 NET_LAN_RX_TASK_PRIO);
+        if (err != OS_ERR_NONE) {
+            uart_puts("[net-demo] Failed to create LAN RX task\n");
+        }
     }
     if (g_wan_if.dev != NULL) {
         net_demo_send_arp_request(&g_wan_if);
+        INT8U err = OSTaskCreate(net_rx_task,
+                                 (void *)&g_wan_if,
+                                 &net_wan_rx_task_stack[NET_RX_TASK_STACK_SIZE - 1u],
+                                 NET_WAN_RX_TASK_PRIO);
+        if (err != OS_ERR_NONE) {
+            uart_puts("[net-demo] Failed to create WAN RX task\n");
+        }
     }
 
-    uint8_t rx_buffer[VIRTIO_NET_MAX_FRAME_SIZE];
-    size_t rx_length = 0u;
-    uint32_t idle_ticks = 0u;
     uint16_t lan_icmp_sequence = 1u;
     uint16_t wan_icmp_sequence = 1u;
-    uint32_t lan_echo_period = 0u;
-    uint32_t wan_echo_period = 0u;
+    INT32U last_arp_tick = OSTimeGet();
+    INT32U lan_last_ping_tick = last_arp_tick;
+    INT32U wan_last_ping_tick = last_arp_tick;
 
     for (;;) {
-        /* Poll LAN interface for packets */
-        if (g_lan_if.dev != NULL && virtio_net_has_pending_rx_dev(g_lan_if.dev)) {
-            while (1) {
-                int rc = virtio_net_poll_frame_dev(g_lan_if.dev, rx_buffer, &rx_length);
-                if (rc < 0) {
-                    uart_puts("[net-demo] ");
-                    uart_puts(g_lan_if.name);
-                    uart_puts(": RX error\n");
-                    break;
-                } else if (rc > 0) {
-                    if (net_demo_process_frame(&g_lan_if, rx_buffer, rx_length) != 0) {
-                        idle_ticks = 0u;
-                        lan_echo_period = 0u;
-                    }
-                } else {
-                    break;
-                }
-            }
-        }
+        INT32U now = OSTimeGet();
 
-        /* Poll WAN interface for packets */
-        if (g_wan_if.dev != NULL && virtio_net_has_pending_rx_dev(g_wan_if.dev)) {
-            while (1) {
-                int rc = virtio_net_poll_frame_dev(g_wan_if.dev, rx_buffer, &rx_length);
-                if (rc < 0) {
-                    uart_puts("[net-demo] ");
-                    uart_puts(g_wan_if.name);
-                    uart_puts(": RX error\n");
-                    break;
-                } else if (rc > 0) {
-                    if (net_demo_process_frame(&g_wan_if, rx_buffer, rx_length) != 0) {
-                        idle_ticks = 0u;
-                        wan_echo_period = 0u;
-                    }
-                } else {
-                    break;
-                }
-            }
-        }
-
-        /* Periodic tasks: send ARP requests for both interfaces */
-        if (++idle_ticks >= 10u) {
-            idle_ticks = 0u;
+        if ((now - last_arp_tick) >= NET_DEMO_ARP_INTERVAL_TICKS) {
+            last_arp_tick = now;
             if (g_lan_if.dev != NULL) {
                 net_demo_send_arp_request(&g_lan_if);
             }
@@ -1050,23 +1059,20 @@ void net_demo_run(void)
             }
         }
 
-        /* Send periodic ICMP pings for LAN interface */
         if (g_lan_if.dev != NULL && g_lan_if.peer_mac_valid) {
-            if (++lan_echo_period >= 5u) {
-                lan_echo_period = 0u;
+            if ((now - lan_last_ping_tick) >= NET_DEMO_PING_INTERVAL_TICKS) {
+                lan_last_ping_tick = now;
                 net_demo_send_icmp_request(&g_lan_if, lan_icmp_sequence++);
             }
         }
 
-        /* Send periodic ICMP pings for WAN interface */
         if (g_wan_if.dev != NULL && g_wan_if.peer_mac_valid) {
-            if (++wan_echo_period >= 5u) {
-                wan_echo_period = 0u;
+            if ((now - wan_last_ping_tick) >= NET_DEMO_PING_INTERVAL_TICKS) {
+                wan_last_ping_tick = now;
                 net_demo_send_icmp_request(&g_wan_if, wan_icmp_sequence++);
             }
         }
 
-        /* Sleep to avoid busy-waiting */
-        OSTimeDlyHMSM(0u, 0u, 0u, NET_DEMO_POLL_DELAY_MS);
+        OSTimeDly(OS_TICKS_PER_SEC / 100u);
     }
 }

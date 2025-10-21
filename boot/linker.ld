@@ -33,6 +33,16 @@ SECTIONS
         __bss_end = .;
     } > RAM
 
+    . = ALIGN(4096);
+    .mmutable (NOLOAD) : ALIGN(4096)
+    {
+        mmu_table_start = .;
+        . = . + 0x10000;
+        mmu_table_end = .;
+    } > RAM
+
     . = ALIGN(16);
     _stack_top = ORIGIN(RAM) + LENGTH(RAM);
+
+    ASSERT((_stack_top - mmu_table_end) >= 0x1000, "Insufficient stack space after MMU table")
 }

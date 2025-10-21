@@ -12,7 +12,7 @@
 #define OS_EVENT_NAME_EN          0u
 
 #define OS_LOWEST_PRIO           10u
-#define OS_MAX_EVENTS             2u
+#define OS_MAX_EVENTS             8u
 #define OS_MAX_FLAGS              1u
 #define OS_MAX_MEM_PART           0u
 #define OS_MAX_QS                 0u
@@ -85,8 +85,8 @@
 #define OS_Q_QUERY_EN             0u
 
 /* ----------------------- SEMAPHORES ------------------------- */
-#define OS_SEM_EN                 0u
-#define OS_SEM_ACCEPT_EN          0u
+#define OS_SEM_EN                 1u
+#define OS_SEM_ACCEPT_EN          1u
 #define OS_SEM_DEL_EN             0u
 #define OS_SEM_PEND_ABORT_EN      0u
 #define OS_SEM_QUERY_EN           0u

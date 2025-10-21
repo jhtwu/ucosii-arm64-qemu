@@ -4,6 +4,7 @@
 
     .extern main
     .extern OS_CPU_ARM_ExceptIrqHndlr
+    .extern mmu_init
 
 _start:
         msr     daifset, #0xf
@@ -61,6 +62,7 @@ el1_entry:
         mov     x0, #0x2
         msr     cntkctl_el1, x0
         bl      zero_bss
+        bl      mmu_init
         ldr     x0, =vector_table
         msr     vbar_el1, x0
         isb

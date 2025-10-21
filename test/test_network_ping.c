@@ -314,7 +314,6 @@ static void test_network_task(void *p_arg)
     (void)p_arg;
     uint8_t rx_buffer[VIRTIO_NET_MAX_FRAME_SIZE];
     size_t rx_length = 0;
-    uint32_t arp_timeout = 0;
     uint32_t ping_wait = 0;
     uint16_t ping_sequence = 1;
 
@@ -342,26 +341,36 @@ static void test_network_task(void *p_arg)
     /* Step 2: ARP resolution */
     uart_puts("[TEST] Starting ARP resolution\n");
     send_arp_request();
-    arp_timeout = 0;
+    INT32U arp_start_tick = OSTimeGet();
+    INT32U last_arp_tick = arp_start_tick;
 
-    while (!g_peer_mac_valid && arp_timeout < ARP_TIMEOUT_MS) {
-        if (virtio_net_has_pending_rx()) {
-            while (1) {
-                int rc = virtio_net_poll_frame(rx_buffer, &rx_length);
-                if (rc > 0) {
-                    process_frame(rx_buffer, rx_length);
-                } else {
-                    break;
-                }
+    while (!g_peer_mac_valid) {
+        while (virtio_net_has_pending_rx()) {
+            int rc = virtio_net_poll_frame(rx_buffer, &rx_length);
+            if (rc > 0) {
+                process_frame(rx_buffer, rx_length);
+            } else {
+                break;
             }
         }
 
-        OSTimeDlyHMSM(0, 0, 0, 100);
-        arp_timeout += 100;
+        if (g_peer_mac_valid) {
+            break;
+        }
 
-        /* Retry ARP every 500ms */
-        if (arp_timeout % 500 == 0 && !g_peer_mac_valid) {
+        INT32U now = OSTimeGet();
+        if ((now - last_arp_tick) >= (OS_TICKS_PER_SEC / 2u)) {
             send_arp_request();
+            last_arp_tick = now;
+        }
+
+        if ((now - arp_start_tick) >= (ARP_TIMEOUT_MS * OS_TICKS_PER_SEC / 1000u)) {
+            break;
+        }
+
+        INT8U err = virtio_net_wait_rx_any(100u);
+        if (err == OS_ERR_TIMEOUT) {
+            continue;
         }
     }
 
@@ -381,20 +390,33 @@ static void test_network_task(void *p_arg)
         ping_wait = 0;
 
         /* Wait for reply with timeout */
-        while (g_waiting_for_ping && ping_wait < PING_TIMEOUT_MS) {
-            if (virtio_net_has_pending_rx()) {
-                while (1) {
-                    int rc = virtio_net_poll_frame(rx_buffer, &rx_length);
-                    if (rc > 0) {
-                        process_frame(rx_buffer, rx_length);
-                    } else {
-                        break;
-                    }
+        while (g_waiting_for_ping) {
+            while (virtio_net_has_pending_rx()) {
+                int rc = virtio_net_poll_frame(rx_buffer, &rx_length);
+                if (rc > 0) {
+                    process_frame(rx_buffer, rx_length);
+                } else {
+                    break;
                 }
             }
 
-            OSTimeDlyHMSM(0, 0, 0, 10);
-            ping_wait += 10;
+            if (!g_waiting_for_ping) {
+                break;
+            }
+
+            if ((get_time_ms() - g_ping_start_time) >= PING_TIMEOUT_MS) {
+                break;
+            }
+
+            INT8U err = virtio_net_wait_rx_any(10u);
+            if (err == OS_ERR_TIMEOUT) {
+                ping_wait += 10u;
+            }
+        }
+
+        ping_wait = get_time_ms() - g_ping_start_time;
+        if (ping_wait > PING_INTERVAL_MS) {
+            ping_wait = PING_INTERVAL_MS;
         }
 
         if (g_waiting_for_ping) {

@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <ucos_ii.h>
 
 /* Default VirtIO MMIO base for QEMU virt machine */
 #define VIRTIO_NET_MMIO_BASE_DEFAULT   0x0A000000u
@@ -36,6 +37,8 @@ int virtio_net_poll_frame_dev(virtio_net_dev_t dev, uint8_t *out_frame, size_t *
 const uint8_t *virtio_net_get_mac_dev(virtio_net_dev_t dev);
 void virtio_net_enable_interrupts_dev(virtio_net_dev_t dev);
 int virtio_net_has_pending_rx_dev(virtio_net_dev_t dev);
+INT8U virtio_net_wait_rx_dev(virtio_net_dev_t dev, uint16_t timeout_ms);
+INT8U virtio_net_wait_rx_any(uint16_t timeout_ms);
 
 /* Legacy single-device operations (operate on device 0) */
 int virtio_net_self_test_registers(void);

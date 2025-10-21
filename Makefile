@@ -21,13 +21,16 @@ C_SRCS := \
     ucosii/source/os_core.c \
     ucosii/source/os_task.c \
     ucosii/source/os_time.c \
+    ucosii/source/os_sem.c \
     bsp/gic.c \
     bsp/uart.c \
     bsp/timer.c \
     bsp/bsp_int.c \
     bsp/bsp_os.c \
     bsp/virtio_net.c \
-    bsp/nat.c
+    bsp/nat.c \
+    bsp/cache.c \
+    bsp/mmu.c
 
 ASM_SRCS := \
     boot/start.S \
@@ -47,12 +50,15 @@ TEST_COMMON_SRCS := \
     ucosii/source/os_core.c \
     ucosii/source/os_task.c \
     ucosii/source/os_time.c \
+    ucosii/source/os_sem.c \
     bsp/gic.c \
     bsp/uart.c \
     bsp/timer.c \
     bsp/bsp_int.c \
     bsp/bsp_os.c \
     bsp/nat.c \
+    bsp/cache.c \
+    bsp/mmu.c \
     src/lib.c \
     src/irq.c \
     boot/start.S
