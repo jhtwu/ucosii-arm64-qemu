@@ -56,6 +56,10 @@ from_el2:
 
 el1_entry:
         msr     spsel, #1
+        /* Enable FP/SIMD at EL1/EL0 (prevents trap in mmu_init SIMD code) */
+        mov     x0, #(3 << 20)
+        msr     cpacr_el1, x0
+        isb
         ldr     x0, =_stack_top
         mov     sp, x0
         /* Initialize CNTKCTL_EL1 like armv8 - allow EL0/EL1 timer access */
