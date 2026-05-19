@@ -24,7 +24,7 @@ static struct arp_entry arp_table[ARP_TABLE_SIZE];
 
 /* NAT configuration */
 static struct nat_config nat_cfg = {
-    .lan_ip = {192, 168, 1, 1},
+    .lan_ip = {192, 168, 1, 2},
     .wan_ip = {10, 3, 5, 99},
     .port_range_start = 20000,
     .port_range_end = 30000

@@ -28,7 +28,7 @@ struct net_interface {
 /* Static addressing for dual network interfaces */
 static struct net_interface g_lan_if = {
     .dev = NULL,
-    .local_ip = {192u, 168u, 1u, 1u},
+    .local_ip = {192u, 168u, 1u, 2u},
     .peer_ip = {192u, 168u, 1u, 103u},
     .peer_mac = {0},
     .peer_mac_valid = false,
