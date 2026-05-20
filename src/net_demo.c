@@ -1018,9 +1018,15 @@ void net_demo_run(void)
     INT32U last_arp_tick = OSTimeGet();
     INT32U lan_last_ping_tick = last_arp_tick;
     INT32U wan_last_ping_tick = last_arp_tick;
+    INT32U last_nat_cleanup_tick = last_arp_tick;
 
     for (;;) {
         INT32U now = OSTimeGet();
+
+        if ((now - last_nat_cleanup_tick) >= (INT32U)OS_TICKS_PER_SEC) {
+            last_nat_cleanup_tick = now;
+            nat_cleanup_expired(now);
+        }
 
         if ((now - last_arp_tick) >= NET_DEMO_ARP_INTERVAL_TICKS) {
             last_arp_tick = now;
