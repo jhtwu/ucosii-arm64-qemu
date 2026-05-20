@@ -464,13 +464,6 @@ static int virtio_net_init_device(size_t dev_idx, uintptr_t base_addr, uint32_t 
         return -1;
     }
 
-    uint64_t par;
-    __asm__ volatile("at s1e1r, %0" :: "r"(dev->base));
-    __asm__ volatile("mrs %0, par_el1" : "=r"(par));
-    uart_puts("[virtio-net] PAR_EL1 = 0x");
-    uart_write_hex((unsigned long)par);
-    uart_putc('\n');
-
     /* Reset device status before negotiation */
     virtio_reg_write(dev, VIRTIO_MMIO_STATUS, 0u);
 
@@ -958,11 +951,7 @@ int virtio_net_send_frame(const uint8_t *frame, size_t length)
     if (g_dev == NULL) {
         return -1;
     }
-    int result = virtio_net_send_frame_dev(g_dev, frame, length);
-    if (result == 0) {
-        uart_puts("[virtio-net] Frame transmitted\n");
-    }
-    return result;
+    return virtio_net_send_frame_dev(g_dev, frame, length);
 }
 
 int virtio_net_poll_frame(uint8_t *out_frame, size_t *out_length)

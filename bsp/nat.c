@@ -163,19 +163,6 @@ int nat_translate_outbound(uint8_t protocol, const uint8_t lan_ip[4], uint16_t l
 
     *wan_port = allocated_port;
     nat_statistics.translations_out++;
-
-    uart_puts("[NAT] New outbound: ");
-    uart_write_dec(lan_ip[0]); uart_putc('.');
-    uart_write_dec(lan_ip[1]); uart_putc('.');
-    uart_write_dec(lan_ip[2]); uart_putc('.');
-    uart_write_dec(lan_ip[3]); uart_putc(':');
-    uart_write_dec(lan_port);
-    uart_puts(" -> WAN:");
-    uart_write_dec(allocated_port);
-    uart_puts(" (proto=");
-    uart_write_dec(protocol);
-    uart_puts(")\n");
-
     return 0;
 }
 
