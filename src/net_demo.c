@@ -706,14 +706,6 @@ static int net_demo_process_frame(struct net_interface *iface,
             if (nat_is_wan_ip(ip->dst) && iface == &g_wan_if && (ip->protocol == 1u || ip->protocol == 6u || ip->protocol == 17u)) {
                 /* Debug: Show we're handling WAN return packet */
                 if (ip->protocol == 6u || ip->protocol == 17u) {
-                    uart_puts("[NAT] WAN return packet proto=");
-                    uart_write_dec(ip->protocol);
-                    uart_puts(" from ");
-                    uart_write_dec(ip->src[0]); uart_putc('.');
-                    uart_write_dec(ip->src[1]); uart_putc('.');
-                    uart_write_dec(ip->src[2]); uart_putc('.');
-                    uart_write_dec(ip->src[3]);
-                    uart_puts(" to WAN IP\n");
                 }
 
                 uint16_t total_length = util_ntohs(ip->total_length);
@@ -791,25 +783,6 @@ static int net_demo_process_frame(struct net_interface *iface,
                         /* Perform reverse NAT translation */
                         if (nat_translate_inbound(proto, wan_port,
                                                  ip->src, src_port, lan_ip, &lan_port) == 0) {
-                            uart_puts("[NAT] ");
-                            uart_puts((ip->protocol == 6u) ? "TCP" : "UDP");
-                            uart_puts(" inbound: ");
-                            uart_write_dec(ip->src[0]); uart_putc('.');
-                            uart_write_dec(ip->src[1]); uart_putc('.');
-                            uart_write_dec(ip->src[2]); uart_putc('.');
-                            uart_write_dec(ip->src[3]);
-                            uart_putc(':');
-                            uart_write_dec(src_port);
-                            uart_puts(" -> ");
-                            uart_write_dec(lan_ip[0]); uart_putc('.');
-                            uart_write_dec(lan_ip[1]); uart_putc('.');
-                            uart_write_dec(lan_ip[2]); uart_putc('.');
-                            uart_write_dec(lan_ip[3]);
-                            uart_putc(':');
-                            uart_write_dec(lan_port);
-                            uart_puts(" (was WAN:");
-                            uart_write_dec(wan_port);
-                            uart_puts(")\n");
                             /* Copy and modify the packet */
                             uint8_t forward_frame[VIRTIO_NET_MAX_FRAME_SIZE];
                             if (length <= VIRTIO_NET_MAX_FRAME_SIZE && g_lan_if.dev != NULL) {

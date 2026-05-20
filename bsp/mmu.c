@@ -34,7 +34,8 @@ static void enable_mmu_and_caches(void)
     sctlr |= (1ULL << 2);   /* D-cache enable */
     sctlr |= (1ULL << 12);  /* I-cache enable */
     sctlr &= ~(1ULL << 25); /* Clear EE bit */
-    sctlr &= ~(1ULL << 4);  /* Clear SA bit */
+    sctlr &= ~(1ULL << 4);  /* Clear SA (EL0 SP alignment check) */
+    sctlr &= ~(1ULL << 3);  /* Clear SA1 (EL1 SP alignment check) */
 
     __asm__ volatile("msr sctlr_el1, %0" :: "r"(sctlr));
     __asm__ volatile("dsb sy");

@@ -1001,8 +1001,10 @@ void virtio_net_interrupt_handler(uint32_t int_id)
     size_t dev_idx;
     struct virtio_net_device *dev = NULL;
 
-    /* Find which device triggered the interrupt based on IRQ number */
-    for (dev_idx = 0u; dev_idx < g_device_count; ++dev_idx) {
+    /* Find which device triggered the interrupt based on IRQ number.
+     * Scan all slots (not just g_device_count) because the interrupt can fire
+     * during device init before g_device_count is incremented by the caller. */
+    for (dev_idx = 0u; dev_idx < VIRTIO_NET_MAX_DEVICES; ++dev_idx) {
         if (g_devices[dev_idx].irq == int_id) {
             dev = &g_devices[dev_idx];
             break;

@@ -3,59 +3,41 @@
 #include "uart.h"
 #include <ucos_ii.h>
 
-/*
- * Arch timer definitions from armv8 project
- */
-enum arch_timer_reg {
-    ARCH_TIMER_REG_CTRL,
-    ARCH_TIMER_REG_TVAL,
-};
-
-#define ARCH_TIMER_PHYS_ACCESS      0
-#define ARCH_TIMER_VIRT_ACCESS      1
-
-#define ARCH_TIMER_CTRL_ENABLE      (1 << 0)
-#define ARCH_TIMER_CTRL_IT_MASK     (1 << 1)  /* Interrupt mask bit */
-#define ARCH_TIMER_CTRL_IT_STAT     (1 << 2)
-
-/* Make sure timer is enabled WITHOUT interrupt mask - critical for periodic operation */
-#define ARCH_TIMER_CTRL_ENABLED_UNMASKED  (ARCH_TIMER_CTRL_ENABLE)  /* Only enable bit, no mask */
+#define ARCH_TIMER_CTRL_ENABLE      (1u << 0)
+#define ARCH_TIMER_CTRL_IT_MASK     (1u << 1)
+#define ARCH_TIMER_CTRL_IT_STAT     (1u << 2)
 
 #ifndef BSP_OS_TMR_PRESCALE
-#define BSP_OS_TMR_PRESCALE         10u   /* Default prescale (tick_rate / 10) */
+#define BSP_OS_TMR_PRESCALE         10u
 #endif
 
 static uint32_t BSP_OS_TmrReload;
 
 /*
- * Arch timer register write function
- */
-static inline void arch_timer_reg_write_cp15(int access, enum arch_timer_reg reg, uint32_t val)
-{
-    if (access == ARCH_TIMER_VIRT_ACCESS) {
-        switch (reg) {
-        case ARCH_TIMER_REG_CTRL:
-            uart_puts("[ARCH_TIMER] Writing CNTV_CTL_EL0\n");
-            __asm__ volatile("msr cntv_ctl_el0, %0" :: "r"(val));
-            break;
-        case ARCH_TIMER_REG_TVAL:
-            __asm__ volatile("msr cntv_tval_el0, %0" :: "r"(val));
-            break;
-        }
-    }
-}
-
-/*
- * Virtual timer reload function - CRITICAL: Must ensure continuous operation
+ * 3-step virtual timer reload (required for level-triggered timer on KVM):
+ *   1. CTL=7: ENABLE=1, IMASK=1 — mask interrupt to clear pending level
+ *   2. TVAL = reload count — set next deadline
+ *   3. CTL=5: ENABLE=1, IMASK=0, ISTAT=1 — re-enable with interrupt unmasked
  */
 static inline void BSP_OS_VirtTimerReload(void)
 {
     uint32_t reload = BSP_OS_TmrReload;
-    if (reload != 0u) {
-        /* Set new timer value for next interrupt */
-        /* Timer remains enabled automatically, no need to touch control register */
-        __asm__ volatile("msr cntv_tval_el0, %0" :: "rZ"(reload));
+    uint32_t ctrl;
+
+    if (reload == 0u) {
+        return;
     }
+
+    /* Step 1: mask interrupt */
+    ctrl = ARCH_TIMER_CTRL_ENABLE | ARCH_TIMER_CTRL_IT_MASK;
+    __asm__ volatile("msr cntv_ctl_el0, %0" :: "r"((uint64_t)ctrl));
+
+    /* Step 2: set new countdown value */
+    __asm__ volatile("msr cntv_tval_el0, %0" :: "r"((uint64_t)reload));
+
+    /* Step 3: re-enable with interrupt unmasked (ENABLE=1, IMASK=0) */
+    ctrl = ARCH_TIMER_CTRL_ENABLE;
+    __asm__ volatile("msr cntv_ctl_el0, %0" :: "r"((uint64_t)ctrl));
 }
 
 /*
@@ -64,7 +46,11 @@ static inline void BSP_OS_VirtTimerReload(void)
 void BSP_OS_TmrTickHandler(uint32_t cpu_id)
 {
     static uint32_t tick_count = 0;
+    uint32_t ctrl;
     (void)cpu_id;
+
+    /* Drive µC/OS-II scheduler first */
+    OSTimeTick();
 
     tick_count++;
     if ((tick_count % 1000) == 0) {
@@ -73,11 +59,8 @@ void BSP_OS_TmrTickHandler(uint32_t cpu_id)
         uart_puts("s\n");
     }
 
-    /* CRITICAL: Reload timer FIRST for next interrupt */
+    /* Reload timer unconditionally — handler was entered because the timer fired */
     BSP_OS_VirtTimerReload();
-
-    /* Drive µC/OS-II scheduler */
-    OSTimeTick();
 }
 
 /*
@@ -111,11 +94,10 @@ void BSP_OS_TmrTickInit(uint32_t tick_rate)
     uart_write_dec(reload);
     uart_putc('\n');
     
-    uart_puts("[BSP_OS] Enabling virtual timer with unmasked interrupts\n");
-    
-    /* Enable timer with interrupt unmasked - critical for continuous operation */
-    arch_timer_reg_write_cp15(ARCH_TIMER_VIRT_ACCESS, ARCH_TIMER_REG_CTRL, ARCH_TIMER_CTRL_ENABLED_UNMASKED);
+    uart_puts("[BSP_OS] Enabling virtual timer\n");
+
+    /* Initial 3-step load: mask → set TVAL → enable unmasked */
     BSP_OS_VirtTimerReload();
-    
+
     uart_puts("[BSP_OS] Timer initialized and running\n");
 }

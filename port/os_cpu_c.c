@@ -50,7 +50,10 @@ void OSInitHookBegin(void)
         OS_CPU_ExceptStk[i] = 0u;
     }
 
-    OS_CPU_ExceptStkBase = &OS_CPU_ExceptStk[OS_CPU_EXCEPT_STK_SIZE - 1u];
+    /* SP must be 16-byte aligned (AArch64 ABI + SCTLR_EL1.SA1).
+     * Point one-past-end of the array, then align down to 16 bytes. */
+    uintptr_t stk_end = (uintptr_t)&OS_CPU_ExceptStk[OS_CPU_EXCEPT_STK_SIZE];
+    OS_CPU_ExceptStkBase = (OS_STK *)(stk_end & ~(uintptr_t)0x0fu);
 }
 
 void OSInitHookEnd(void)

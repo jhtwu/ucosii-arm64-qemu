@@ -24,7 +24,7 @@
 
 /* GIC CPU Interface constants from armv8 project */
 #define ICC_SRE_EL1_SRE         (1U << 0)
-#define ICC_CTLR_EL1_EOImode_drop_dir   (0U << 1)
+#define ICC_CTLR_EL1_EOImode_split      (1U << 1)   /* Split EOI: EOIR=priority-drop, DIR=deactivate */
 #define DEFAULT_PMR_VALUE       0xF0u
 
 /* System register access functions like armv8 */
@@ -104,9 +104,9 @@ static void gic_cpu_sys_reg_init(void)
     uart_puts("[GIC] Setting binary point register\n");
     gic_write_bpr1(0);
 
-    /* Set control register - EOI deactivates interrupt too */
+    /* Set control register - EOImode=0: EOIR does full priority drop + deactivation */
     uart_puts("[GIC] Setting control register\n");
-    gic_write_ctlr(ICC_CTLR_EL1_EOImode_drop_dir);
+    gic_write_ctlr(0u);
 
     /* Enable Group 1 interrupts */
     uart_puts("[GIC] Enabling Group 1 interrupts\n");
@@ -175,9 +175,8 @@ uint32_t gic_acknowledge(void)
 
 void gic_end_interrupt(uint32_t int_id)
 {
+    /* EOImode=0: EOIR does full priority drop + deactivation — no DIR write */
     __asm__ volatile("msr S3_0_c12_c12_1, %x0" :: "rZ"((uint64_t)int_id));  /* ICC_EOIR1_EL1 */
-    __asm__ volatile("isb");
-    __asm__ volatile("msr S3_0_c12_c11_1, %x0" :: "rZ"((uint64_t)int_id));  /* ICC_DIR_EL1 */
     __asm__ volatile("isb");
 }
 

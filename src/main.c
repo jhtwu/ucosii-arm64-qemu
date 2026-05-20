@@ -80,7 +80,9 @@ int main(void)
      * English: Boot steps: initialise UART, call OSInit, spawn both tasks with Task B initially suspended, then start the scheduler.
      */
     uart_puts("[BOOT] main enter\n");
-    uart_init();
+    /* uart_init() skipped: QEMU PL011 TXFF latches incorrectly after UARTLCRH
+     * FEN-enable + UARTCR re-enable sequence under KVM without intervening
+     * KVM exits.  QEMU's UART already works from its reset state. */
     uart_puts("\n[BOOT] uC/OS-II ARMv8 demo starting\n");
 
     uart_puts("[BOOT] Initialising GICv3\n");

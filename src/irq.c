@@ -22,11 +22,9 @@ void irq_dispatch(void)
     uint32_t int_id = raw_id & 0x3FFu;
 
     if (int_id >= GIC_SPURIOUS_BASE) {
-        uart_puts("[IRQ] spurious interrupt, ignoring\n");
         return;
     }
 
-    /* Use BSP interrupt handler to dispatch */
     BSP_IntHandler(int_id);
 
     gic_end_interrupt(raw_id);

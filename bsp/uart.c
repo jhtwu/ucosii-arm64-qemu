@@ -20,12 +20,19 @@
  */
 void uart_init(void)
 {
+    /* QEMU PL011 TXFF latches incorrectly when the UART is reconfigured
+     * (UARTCR=0 disable + UARTLCRH FIFO-enable + UARTCR re-enable) under KVM
+     * because the last config write has no KVM exit before the first UARTFR
+     * read.  A DSB+ISB after the final write drains the KVM MMIO pipeline and
+     * ensures UARTFR reflects the new state before uart_putc spins on TXFF. */
     mmio_write32(UARTCR, 0u);
     mmio_write32(UARTIMSC, 0u);
     mmio_write32(UARTIBRD, 13u);
     mmio_write32(UARTFBRD, 2u);
     mmio_write32(UARTLCRH, (3u << 5) | (1u << 4));
     mmio_write32(UARTCR, (1u << 9) | (1u << 8) | (1u << 0));
+    __asm__ volatile("dsb sy" ::: "memory");
+    __asm__ volatile("isb" ::: "memory");
 }
 
 /*
