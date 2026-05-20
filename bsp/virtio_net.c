@@ -51,8 +51,9 @@
 #define VIRTIO_NET_RX_QUEUE             0u
 #define VIRTIO_NET_TX_QUEUE             1u
 
-#define VIRTIO_NET_QUEUE_SIZE           64u
+#define VIRTIO_NET_QUEUE_SIZE           256u
 #define VIRTIO_NET_BUFFER_SIZE          2048u
+#define VIRTIO_NET_TX_BATCH_SIZE        16u   /* notify host every N queued TX frames */
 
 struct virtio_net_hdr {
     uint8_t flags;
@@ -116,6 +117,7 @@ struct virtio_net_device {
     uint8_t *rx_buffers[VIRTIO_NET_QUEUE_SIZE];
     uint8_t *tx_buffers[VIRTIO_NET_QUEUE_SIZE];
     OS_EVENT *rx_sem;
+    uint16_t tx_batch_count;   /* frames queued but host not yet notified */
 };
 
 /* Multiple device support */
@@ -739,9 +741,25 @@ int virtio_net_send_frame_dev(virtio_net_dev_t dev, const uint8_t *frame, size_t
     cache_clean_range(&avail->ring[idx], sizeof(avail->ring[idx]));
     cache_clean_range(&avail->idx, sizeof(avail->idx));
 
-    virtio_reg_write(dev, VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_TX_QUEUE);
+    dev->tx_batch_count++;
+    if (dev->tx_batch_count >= VIRTIO_NET_TX_BATCH_SIZE) {
+        virtio_reg_write(dev, VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_TX_QUEUE);
+        dev->tx_batch_count = 0u;
+    }
 
     return 0;
+}
+
+void virtio_net_tx_flush_dev(size_t dev_idx)
+{
+    if (dev_idx >= g_device_count) {
+        return;
+    }
+    struct virtio_net_device *dev = &g_devices[dev_idx];
+    if (dev->tx_batch_count > 0u) {
+        virtio_reg_write(dev, VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_TX_QUEUE);
+        dev->tx_batch_count = 0u;
+    }
 }
 
 int virtio_net_poll_frame_dev(virtio_net_dev_t dev, uint8_t *out_frame, size_t *out_length)

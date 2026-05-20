@@ -354,7 +354,7 @@ static void send_icmp_echo_reply(struct net_interface *iface,
 }
 
 static int net_demo_process_frame(struct net_interface *iface,
-                                   const uint8_t *frame, size_t length)
+                                   uint8_t *frame, size_t length)
 {
     if (length < sizeof(struct eth_header)) {
         return 0;
@@ -427,13 +427,10 @@ static int net_demo_process_frame(struct net_interface *iface,
                     /* Perform reverse NAT translation */
                     if (nat_translate_inbound(NAT_PROTO_ICMP, wan_port,
                                              ip->src, 0, lan_ip, &lan_port) == 0) {
-                        /* Copy and modify the packet */
-                        uint8_t forward_frame[VIRTIO_NET_MAX_FRAME_SIZE];
+                        /* Modify the packet in-place (frame is a private rx_buffer copy) */
                         if (length <= VIRTIO_NET_MAX_FRAME_SIZE && g_lan_if.dev != NULL) {
-                            util_memcpy(forward_frame, frame, length);
-
-                            struct eth_header *fwd_eth = (struct eth_header *)forward_frame;
-                            struct ipv4_header *fwd_ip = (struct ipv4_header *)(forward_frame + sizeof(*fwd_eth));
+                            struct eth_header *fwd_eth = (struct eth_header *)frame;
+                            struct ipv4_header *fwd_ip = (struct ipv4_header *)(frame + sizeof(*fwd_eth));
                             struct icmp_header *fwd_icmp = (struct icmp_header *)((uint8_t *)fwd_ip + ip_header_len);
 
                             /* Update Ethernet header */
@@ -458,7 +455,7 @@ static int net_demo_process_frame(struct net_interface *iface,
                             fwd_icmp->checksum = util_htons(checksum16(fwd_icmp, icmp_len));
 
                             /* Send on LAN interface */
-                            virtio_net_send_frame_dev(g_lan_if.dev, forward_frame,
+                            virtio_net_send_frame_dev(g_lan_if.dev, frame,
                                                     sizeof(*fwd_eth) + total_length);
                             return 1;
                         }
@@ -499,13 +496,10 @@ static int net_demo_process_frame(struct net_interface *iface,
                 /* Perform reverse NAT translation */
                 if (nat_translate_inbound(proto, wan_port,
                                          ip->src, src_port, lan_ip, &lan_port) == 0) {
-                    /* Copy and modify the packet */
-                    uint8_t forward_frame[VIRTIO_NET_MAX_FRAME_SIZE];
+                    /* Modify the packet in-place (frame is a private rx_buffer copy) */
                     if (length <= VIRTIO_NET_MAX_FRAME_SIZE && g_lan_if.dev != NULL) {
-                        util_memcpy(forward_frame, frame, length);
-
-                        struct eth_header *fwd_eth = (struct eth_header *)forward_frame;
-                        struct ipv4_header *fwd_ip = (struct ipv4_header *)(forward_frame + sizeof(*fwd_eth));
+                        struct eth_header *fwd_eth = (struct eth_header *)frame;
+                        struct ipv4_header *fwd_ip = (struct ipv4_header *)(frame + sizeof(*fwd_eth));
 
                         /* Update Ethernet header */
                         const uint8_t *lan_mac = virtio_net_get_mac_dev(g_lan_if.dev);
@@ -539,7 +533,7 @@ static int net_demo_process_frame(struct net_interface *iface,
                         }
 
                         /* Send on LAN interface */
-                        virtio_net_send_frame_dev(g_lan_if.dev, forward_frame,
+                        virtio_net_send_frame_dev(g_lan_if.dev, frame,
                                                 sizeof(*fwd_eth) + total_length);
                         return 1;
                     }
@@ -592,13 +586,10 @@ static int net_demo_process_frame(struct net_interface *iface,
                             /* Perform NAT translation */
                             if (nat_translate_outbound(NAT_PROTO_ICMP, ip->src, icmp_id,
                                                       ip->dst, 0, &wan_port) == 0) {
-                                /* Copy and modify the packet */
-                                uint8_t forward_frame[VIRTIO_NET_MAX_FRAME_SIZE];
+                                /* Modify the packet in-place (frame is a private rx_buffer copy) */
                                 if (length <= VIRTIO_NET_MAX_FRAME_SIZE) {
-                                    util_memcpy(forward_frame, frame, length);
-
-                                    struct eth_header *fwd_eth = (struct eth_header *)forward_frame;
-                                    struct ipv4_header *fwd_ip = (struct ipv4_header *)(forward_frame + sizeof(*fwd_eth));
+                                    struct eth_header *fwd_eth = (struct eth_header *)frame;
+                                    struct ipv4_header *fwd_ip = (struct ipv4_header *)(frame + sizeof(*fwd_eth));
                                     struct icmp_header *fwd_icmp = (struct icmp_header *)((uint8_t *)fwd_ip + ip_header_len);
 
                                     /* Update Ethernet header */
@@ -623,7 +614,7 @@ static int net_demo_process_frame(struct net_interface *iface,
                                     fwd_icmp->checksum = util_htons(checksum16(fwd_icmp, icmp_len));
 
                                     /* Send on WAN interface */
-                                    virtio_net_send_frame_dev(g_wan_if.dev, forward_frame,
+                                    virtio_net_send_frame_dev(g_wan_if.dev, frame,
                                                             sizeof(*fwd_eth) + total_length);
                                     return 1;
                                 }
@@ -653,13 +644,10 @@ static int net_demo_process_frame(struct net_interface *iface,
                         /* Perform NAT translation */
                         if (nat_translate_outbound(proto, ip->src, src_port,
                                                   ip->dst, dst_port, &wan_port) == 0) {
-                            /* Copy and modify the packet */
-                            uint8_t forward_frame[VIRTIO_NET_MAX_FRAME_SIZE];
+                            /* Modify the packet in-place (frame is a private rx_buffer copy) */
                             if (length <= VIRTIO_NET_MAX_FRAME_SIZE) {
-                                util_memcpy(forward_frame, frame, length);
-
-                                struct eth_header *fwd_eth = (struct eth_header *)forward_frame;
-                                struct ipv4_header *fwd_ip = (struct ipv4_header *)(forward_frame + sizeof(*fwd_eth));
+                                struct eth_header *fwd_eth = (struct eth_header *)frame;
+                                struct ipv4_header *fwd_ip = (struct ipv4_header *)(frame + sizeof(*fwd_eth));
 
                                 /* Update Ethernet header */
                                 const uint8_t *wan_mac = virtio_net_get_mac_dev(g_wan_if.dev);
@@ -693,7 +681,7 @@ static int net_demo_process_frame(struct net_interface *iface,
                                 }
 
                                 /* Send on WAN interface */
-                                virtio_net_send_frame_dev(g_wan_if.dev, forward_frame,
+                                virtio_net_send_frame_dev(g_wan_if.dev, frame,
                                                         sizeof(*fwd_eth) + total_length);
                                 return 1;
                             }
@@ -722,13 +710,10 @@ static int net_demo_process_frame(struct net_interface *iface,
                         /* Perform reverse NAT translation */
                         if (nat_translate_inbound(NAT_PROTO_ICMP, wan_port,
                                                  ip->src, 0, lan_ip, &lan_port) == 0) {
-                            /* Copy and modify the packet */
-                            uint8_t forward_frame[VIRTIO_NET_MAX_FRAME_SIZE];
+                            /* Modify the packet in-place (frame is a private rx_buffer copy) */
                             if (length <= VIRTIO_NET_MAX_FRAME_SIZE && g_lan_if.dev != NULL) {
-                                util_memcpy(forward_frame, frame, length);
-
-                                struct eth_header *fwd_eth = (struct eth_header *)forward_frame;
-                                struct ipv4_header *fwd_ip = (struct ipv4_header *)(forward_frame + sizeof(*fwd_eth));
+                                struct eth_header *fwd_eth = (struct eth_header *)frame;
+                                struct ipv4_header *fwd_ip = (struct ipv4_header *)(frame + sizeof(*fwd_eth));
                                 struct icmp_header *fwd_icmp = (struct icmp_header *)((uint8_t *)fwd_ip + ip_header_len);
 
                                 /* Update Ethernet header */
@@ -754,7 +739,7 @@ static int net_demo_process_frame(struct net_interface *iface,
                                 fwd_icmp->checksum = util_htons(checksum16(fwd_icmp, icmp_len));
 
                                 /* Send on LAN interface */
-                                virtio_net_send_frame_dev(g_lan_if.dev, forward_frame,
+                                virtio_net_send_frame_dev(g_lan_if.dev, frame,
                                                         sizeof(*fwd_eth) + total_length);
                                 return 1;
                             }
@@ -783,13 +768,10 @@ static int net_demo_process_frame(struct net_interface *iface,
                         /* Perform reverse NAT translation */
                         if (nat_translate_inbound(proto, wan_port,
                                                  ip->src, src_port, lan_ip, &lan_port) == 0) {
-                            /* Copy and modify the packet */
-                            uint8_t forward_frame[VIRTIO_NET_MAX_FRAME_SIZE];
+                            /* Modify the packet in-place (frame is a private rx_buffer copy) */
                             if (length <= VIRTIO_NET_MAX_FRAME_SIZE && g_lan_if.dev != NULL) {
-                                util_memcpy(forward_frame, frame, length);
-
-                                struct eth_header *fwd_eth = (struct eth_header *)forward_frame;
-                                struct ipv4_header *fwd_ip = (struct ipv4_header *)(forward_frame + sizeof(*fwd_eth));
+                                struct eth_header *fwd_eth = (struct eth_header *)frame;
+                                struct ipv4_header *fwd_ip = (struct ipv4_header *)(frame + sizeof(*fwd_eth));
 
                                 /* Update Ethernet header */
                                 const uint8_t *lan_mac = virtio_net_get_mac_dev(g_lan_if.dev);
@@ -822,7 +804,7 @@ static int net_demo_process_frame(struct net_interface *iface,
                                 }
 
                                 /* Send on LAN interface */
-                                virtio_net_send_frame_dev(g_lan_if.dev, forward_frame,
+                                virtio_net_send_frame_dev(g_lan_if.dev, frame,
                                                         sizeof(*fwd_eth) + total_length);
                                 return 1;
                             }
@@ -905,6 +887,9 @@ static void net_rx_task(void *p_arg)
                 break;
             }
         }
+        /* Flush any TX frames batched during this RX burst */
+        virtio_net_tx_flush_dev(0u);
+        virtio_net_tx_flush_dev(1u);
 
         INT8U err = virtio_net_wait_rx_dev(iface->dev, 0u);
         if (err != OS_ERR_NONE) {

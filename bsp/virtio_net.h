@@ -39,6 +39,7 @@ void virtio_net_enable_interrupts_dev(virtio_net_dev_t dev);
 int virtio_net_has_pending_rx_dev(virtio_net_dev_t dev);
 INT8U virtio_net_wait_rx_dev(virtio_net_dev_t dev, uint16_t timeout_ms);
 INT8U virtio_net_wait_rx_any(uint16_t timeout_ms);
+void virtio_net_tx_flush_dev(size_t dev_idx);
 
 /* Legacy single-device operations (operate on device 0) */
 int virtio_net_self_test_registers(void);
