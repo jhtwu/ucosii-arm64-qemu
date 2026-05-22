@@ -167,17 +167,15 @@ static struct virtio_net_device *g_dev = NULL;
 static inline uint32_t virtio_mmio_read32(uintptr_t base, uint32_t offset)
 {
     uint32_t value = mmio_read32(base + offset);
-    __asm__ volatile("dsb sy" ::: "memory");
-    __asm__ volatile("isb" ::: "memory");
+    __asm__ volatile("dsb ish" ::: "memory");
     return value;
 }
 
 static inline void virtio_mmio_write32(uintptr_t base, uint32_t offset, uint32_t value)
 {
-    __asm__ volatile("dsb sy" ::: "memory");
+    __asm__ volatile("dsb ishst" ::: "memory");
     mmio_write32(base + offset, value);
-    __asm__ volatile("dsb sy" ::: "memory");
-    __asm__ volatile("isb" ::: "memory");
+    __asm__ volatile("dsb ish" ::: "memory");
 }
 
 static inline uint32_t virtio_reg_read(const struct virtio_net_device *dev, uint32_t offset)
@@ -307,14 +305,15 @@ static void virtio_net_handle_rx_used(struct virtio_net_device *dev, size_t dev_
     struct vring_used *used = queue->used;
     struct vring_avail *avail = queue->avail;
 
+    /* Batch invalidate entire used ring before scanning */
+    cache_invalidate_range(used, sizeof(struct vring_used) + queue_size * sizeof(struct vring_used_elem));
+
     while (1) {
-        cache_invalidate_range(used, sizeof(*used));
         if (dev->rx_last_used == used->idx) {
             break;
         }
         uint16_t used_index = (uint16_t)(dev->rx_last_used % queue_size);
         struct vring_used_elem *elem = &used->ring[used_index];
-        cache_invalidate_range(elem, sizeof(*elem));
         uint16_t desc_id = (uint16_t)elem->id;
 
         if (desc_id >= queue_size) {
