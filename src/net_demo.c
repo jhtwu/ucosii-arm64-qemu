@@ -887,6 +887,9 @@ static void net_rx_task(void *p_arg)
                 break;
             }
         }
+        /* Replenish RX descriptors once per burst */
+        virtio_net_rx_flush_dev(0u);
+        virtio_net_rx_flush_dev(1u);
         /* Flush any TX frames batched during this RX burst */
         virtio_net_tx_flush_dev(0u);
         virtio_net_tx_flush_dev(1u);

@@ -762,6 +762,18 @@ void virtio_net_tx_flush_dev(size_t dev_idx)
     }
 }
 
+void virtio_net_rx_flush_dev(size_t dev_idx)
+{
+    if (dev_idx >= VIRTIO_NET_MAX_DEVICES) {
+        return;
+    }
+    struct virtio_net_device *dev = &g_devices[dev_idx];
+    if (dev == NULL) {
+        return;
+    }
+    virtio_reg_write(dev, VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_RX_QUEUE);
+}
+
 int virtio_net_poll_frame_dev(virtio_net_dev_t dev, uint8_t *out_frame, size_t *out_length)
 {
     if (dev == NULL || !dev->driver_ok) {
@@ -827,8 +839,6 @@ int virtio_net_poll_frame_dev(virtio_net_dev_t dev, uint8_t *out_frame, size_t *
     cache_clean_range(&avail->ring[avail_slot], sizeof(avail->ring[avail_slot]));
     avail->idx++;
     cache_clean_range(&avail->idx, sizeof(avail->idx));
-
-    virtio_reg_write(dev, VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_RX_QUEUE);
 
     return (payload_len > 0u) ? 1 : 0;
 }

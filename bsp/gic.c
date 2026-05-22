@@ -67,29 +67,20 @@ static inline int gic_enable_sre(void)
 {
     uint32_t val;
 
-    uart_puts("[GIC] Enabling system register interface\n");
-
     val = gic_read_sre();
     if (val & ICC_SRE_EL1_SRE) {
-        uart_puts("[GIC] SRE already enabled\n");
         return 1;
     }
 
-    uart_puts("[GIC] Setting SRE bit\n");
     val |= ICC_SRE_EL1_SRE;
     gic_write_sre(val);
     val = gic_read_sre();
 
-    uart_puts("[GIC] SRE enable result: ");
-    uart_write_hex(val);
-    uart_putc('\n');
     return !!(val & ICC_SRE_EL1_SRE);
 }
 
 static void gic_cpu_sys_reg_init(void)
 {
-    uart_puts("[GIC] CPU system register initialization\n");
-    
     /* Enable system register interface */
     if (!gic_enable_sre()) {
         uart_puts("[GIC] ERROR: Unable to set SRE (disabled at EL2)\n");
@@ -97,48 +88,32 @@ static void gic_cpu_sys_reg_init(void)
     }
 
     /* Set priority mask register */
-    uart_puts("[GIC] Setting priority mask\n");
     gic_write_pmr(DEFAULT_PMR_VALUE);
 
     /* Set binary point register */
-    uart_puts("[GIC] Setting binary point register\n");
     gic_write_bpr1(0);
 
     /* Set control register - EOImode=0: EOIR does full priority drop + deactivation */
-    uart_puts("[GIC] Setting control register\n");
     gic_write_ctlr(0u);
 
     /* Enable Group 1 interrupts */
-    uart_puts("[GIC] Enabling Group 1 interrupts\n");
     gic_write_grpen1(1);
-    
-    uart_puts("[GIC] CPU interface system registers configured\n");
 }
 
 void gic_init(void)
 {
-    uart_puts("[GIC] Starting complete armv8-style GIC initialization\n");
-    
-    /* Test distributor access */
-    uint32_t gicd_ctrl = mmio_read32(GICD_CTLR);
-    uart_puts("[GIC] GICD_CTLR = ");
-    uart_write_hex(gicd_ctrl);
-    uart_putc('\n');
-    
     /* Phase 1: Distributor initialization */
-    uart_puts("[GIC] Phase 1: Distributor initialization\n");
     mmio_write32(GICD_CTLR, 0u);
     mmio_write32(GICD_CTLR, GICD_CTLR_ENABLE);
-    
+
     /* Phase 2: Redistributor initialization */
-    uart_puts("[GIC] Phase 2: Redistributor initialization\n");
-    
+
     /* Set all PPIs/SGIs to Group 1 */
     mmio_write32(GICR_IGROUPR0, 0xFFFFFFFFu);
-    
+
     /* Configure timer interrupt 27 */
     uint32_t timer_id = 27u;
-    
+
     /* Set priority */
     uint32_t priority_reg = GICR_IPRIORITYR(timer_id / 4u);
     uint32_t priority = mmio_read32(priority_reg);
@@ -146,24 +121,19 @@ void gic_init(void)
     priority &= ~(0xFFu << shift);
     priority |= (0x80u << shift);
     mmio_write32(priority_reg, priority);
-    
+
     /* Enable interrupt */
     mmio_write32(GICR_ISENABLER0, (1u << timer_id));
-    
+
     /* Configure as edge-triggered */
     uint32_t cfg_reg = GICR_ICFGR0 + 4u;
     uint32_t cfg = mmio_read32(cfg_reg);
     uint32_t cfg_shift = ((timer_id - 16u) * 2u);
     cfg |= (0x2u << cfg_shift);
     mmio_write32(cfg_reg, cfg);
-    
-    uart_puts("[GIC] Timer interrupt 27 configured\n");
-    
+
     /* Phase 3: CPU interface system register initialization */
-    uart_puts("[GIC] Phase 3: CPU interface initialization\n");
     gic_cpu_sys_reg_init();
-    
-    uart_puts("[GIC] Complete GICv3 initialization finished\n");
 }
 
 uint32_t gic_acknowledge(void)
@@ -187,27 +157,15 @@ void gic_enable_spi_interrupt(uint32_t int_id)
         uart_puts("[GIC] Error: Invalid SPI interrupt ID\n");
         return;
     }
-    
-    uart_puts("[GIC] Enabling SPI interrupt ");
-    uart_write_dec(int_id);
-    uart_putc('\n');
-    
+
     /* Calculate register offset for GICD_ISENABLER */
     uint32_t reg_offset = (int_id / 32u) * 4u;
     uint32_t bit_offset = int_id % 32u;
     uint32_t reg_addr = GICD_BASE + 0x100u + reg_offset; /* GICD_ISENABLER base */
-    
-    uart_puts("[GIC] Writing to GICD_ISENABLER");
-    uart_write_dec(int_id / 32u);
-    uart_puts(" at 0x");
-    uart_write_hex((unsigned long)reg_addr);
-    uart_puts(", bit ");
-    uart_write_dec(bit_offset);
-    uart_putc('\n');
-    
+
     /* Enable the interrupt */
     mmio_write32(reg_addr, (1u << bit_offset));
-    
+
     /* Set interrupt priority (lower value = higher priority) */
     uint32_t prio_reg_offset = int_id * 1u; /* 8-bit per interrupt */
     uint32_t prio_reg_addr = GICD_BASE + 0x400u + prio_reg_offset; /* GICD_IPRIORITYR base */
@@ -223,8 +181,6 @@ void gic_enable_spi_interrupt(uint32_t int_id)
         /* Set to CPU 0 (MPIDR = 0) */
         mmio_write32(router_addr_low, 0u);   /* Lower 32 bits: Aff0, Aff1, Aff2 */
         mmio_write32(router_addr_high, 0u);  /* Upper 32 bits: Aff3, IRM */
-
-        uart_puts("[GIC] Routed to CPU 0 via GICD_IROUTER\n");
     }
 
     /* Set interrupt to Group 1 */
@@ -234,8 +190,4 @@ void gic_enable_spi_interrupt(uint32_t int_id)
     uint32_t group_val = mmio_read32(group_reg_addr);
     group_val |= (1u << group_bit_offset);
     mmio_write32(group_reg_addr, group_val);
-
-    uart_puts("[GIC] SPI interrupt ");
-    uart_write_dec(int_id);
-    uart_puts(" enabled\n");
 }
