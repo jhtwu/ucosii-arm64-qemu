@@ -289,6 +289,7 @@ static void virtio_net_prepare_tx(struct virtio_net_device *dev, size_t dev_idx)
         desc[i].next = 0u;
     }
     avail->idx = 0u;
+    avail->flags = 0x0001u;  /* VIRTQ_AVAIL_F_NO_INTERRUPT: suppress TX used-buffer notifications */
     dev->tx_last_used = 0u;
 
     cache_clean_range(desc, sizeof(struct vring_desc) * dev->tx_queue_size);
@@ -1123,20 +1124,13 @@ void virtio_net_interrupt_handler(uint32_t int_id)
         return;
     }
 
-    /* Read interrupt status */
+    /* Read interrupt status and ACK immediately (RT-Thread pattern) */
     interrupt_status = virtio_reg_read(dev, VIRTIO_MMIO_INTERRUPT_STATUS);
+    virtio_reg_write(dev, VIRTIO_MMIO_INTERRUPT_ACK, interrupt_status);
 
     if (interrupt_status & 0x1u) {  /* Used buffer notification */
-        if (dev->tx_queue != NULL) {
-            cache_invalidate_range(dev->tx_queue->used, sizeof(*dev->tx_queue->used));
-            dev->tx_last_used = dev->tx_queue->used->idx;
-        }
-
         virtio_net_handle_rx_used(dev, dev_idx);
     }
-
-    /* Acknowledge interrupt */
-    virtio_reg_write(dev, VIRTIO_MMIO_INTERRUPT_ACK, interrupt_status);
 }
 
 /* Check if there are pending RX packets */
