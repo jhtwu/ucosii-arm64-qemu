@@ -54,6 +54,7 @@
 #define VIRTIO_NET_QUEUE_SIZE           256u
 #define VIRTIO_NET_BUFFER_SIZE          2048u
 #define VIRTIO_NET_TX_BATCH_SIZE        16u   /* notify host every N queued TX frames */
+#define VRING_USED_F_NO_NOTIFY          0x0001u  /* device asks driver not to notify */
 
 struct virtio_net_hdr {
     uint8_t flags;
@@ -265,6 +266,7 @@ static void virtio_net_prepare_rx(struct virtio_net_device *dev, size_t dev_idx)
         avail->ring[i] = i;
     }
     avail->idx = dev->rx_queue_size;
+    avail->flags = 0u;  /* Explicitly enable RX used-buffer interrupts (CHERI pattern) */
     dev->rx_last_used = 0u;
     g_rx_completion_head[dev_idx] = 0u;
     g_rx_completion_tail[dev_idx] = 0u;
@@ -728,14 +730,13 @@ int virtio_net_send_frame_dev(virtio_net_dev_t dev, const uint8_t *frame, size_t
 
     uint16_t idx = (uint16_t)(avail->idx % dev->tx_queue_size);
     uint8_t *buffer = dev->tx_buffers[idx];
-    struct virtio_net_hdr *hdr = (struct virtio_net_hdr *)buffer;
 
-    util_memset(hdr, 0, sizeof(*hdr));
-    util_memcpy(buffer + sizeof(*hdr), frame, length);
-    cache_clean_range(buffer, length + sizeof(*hdr));
+    /* TX buffer already zeroed in virtio_net_prepare_tx(); skip per-TX memset */
+    util_memcpy(buffer + sizeof(struct virtio_net_hdr), frame, length);
+    cache_clean_range(buffer, length + sizeof(struct virtio_net_hdr));
 
     desc[idx].addr = (uint64_t)(uintptr_t)buffer;
-    desc[idx].len = (uint32_t)(length + sizeof(*hdr));
+    desc[idx].len = (uint32_t)(length + sizeof(struct virtio_net_hdr));
     desc[idx].flags = 0u;
     desc[idx].next = 0u;
     cache_clean_range(&desc[idx], sizeof(desc[idx]));
@@ -747,7 +748,10 @@ int virtio_net_send_frame_dev(virtio_net_dev_t dev, const uint8_t *frame, size_t
 
     dev->tx_batch_count++;
     if (dev->tx_batch_count >= VIRTIO_NET_TX_BATCH_SIZE) {
-        virtio_reg_write(dev, VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_TX_QUEUE);
+        cache_invalidate_range(&dev->tx_queue->used->flags, sizeof(uint16_t));
+        if (!(dev->tx_queue->used->flags & VRING_USED_F_NO_NOTIFY)) {
+            virtio_reg_write(dev, VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_TX_QUEUE);
+        }
         dev->tx_batch_count = 0u;
     }
 
@@ -761,7 +765,11 @@ void virtio_net_tx_flush_dev(size_t dev_idx)
     }
     struct virtio_net_device *dev = &g_devices[dev_idx];
     if (dev->tx_batch_count > 0u) {
-        virtio_reg_write(dev, VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_TX_QUEUE);
+        /* Check if device wants to suppress TX notifications */
+        cache_invalidate_range(&dev->tx_queue->used->flags, sizeof(uint16_t));
+        if (!(dev->tx_queue->used->flags & VRING_USED_F_NO_NOTIFY)) {
+            virtio_reg_write(dev, VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_TX_QUEUE);
+        }
         dev->tx_batch_count = 0u;
     }
 }
@@ -773,6 +781,10 @@ void virtio_net_rx_flush_dev(size_t dev_idx)
     }
     struct virtio_net_device *dev = &g_devices[dev_idx];
     if (dev == NULL) {
+        return;
+    }
+    /* Skip notify if device has set VRING_USED_F_NO_NOTIFY */
+    if (dev->rx_queue->used->flags & VRING_USED_F_NO_NOTIFY) {
         return;
     }
     virtio_reg_write(dev, VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_RX_QUEUE);
