@@ -973,6 +973,11 @@ int virtio_net_has_pending_rx_dev(virtio_net_dev_t dev)
         return 0;
     }
 
+    /* Lazy scan: if completion queue empty, scan RX used ring in task context */
+    if (g_rx_completion_count[dev_idx] == 0u) {
+        virtio_net_handle_rx_used(dev, dev_idx);
+    }
+
     return (g_rx_completion_count[dev_idx] > 0u) ? 1 : 0;
 }
 
@@ -1107,16 +1112,14 @@ void virtio_net_debug_dump_status(void)
     log_status("[virtio-net] INTERRUPT_STATUS", interrupt_status);
 }
 
-/* VirtIO network interrupt handler */
+/* VirtIO network interrupt handler — lightweight: ACK only, no ring scanning */
 void virtio_net_interrupt_handler(uint32_t int_id)
 {
     uint32_t interrupt_status;
     size_t dev_idx;
     struct virtio_net_device *dev = NULL;
 
-    /* Find which device triggered the interrupt based on IRQ number.
-     * Scan all slots (not just g_device_count) because the interrupt can fire
-     * during device init before g_device_count is incremented by the caller. */
+    /* Find which device triggered the interrupt based on IRQ number. */
     for (dev_idx = 0u; dev_idx < VIRTIO_NET_MAX_DEVICES; ++dev_idx) {
         if (g_devices[dev_idx].irq == int_id) {
             dev = &g_devices[dev_idx];
@@ -1128,12 +1131,18 @@ void virtio_net_interrupt_handler(uint32_t int_id)
         return;
     }
 
-    /* Read interrupt status and ACK immediately (RT-Thread pattern) */
+    /* Read interrupt status and ACK immediately */
     interrupt_status = virtio_reg_read(dev, VIRTIO_MMIO_INTERRUPT_STATUS);
     virtio_reg_write(dev, VIRTIO_MMIO_INTERRUPT_ACK, interrupt_status);
 
     if (interrupt_status & 0x1u) {  /* Used buffer notification */
-        virtio_net_handle_rx_used(dev, dev_idx);
+        /* Signal task to process RX — do not scan ring in ISR */
+        if (dev->rx_sem != NULL) {
+            OSSemPost(dev->rx_sem);
+        }
+        if (g_rx_global_sem != NULL) {
+            OSSemPost(g_rx_global_sem);
+        }
     }
 }
 
