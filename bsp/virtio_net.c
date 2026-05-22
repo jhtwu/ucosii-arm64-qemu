@@ -174,7 +174,6 @@ static inline uint32_t virtio_mmio_read32(uintptr_t base, uint32_t offset)
 
 static inline void virtio_mmio_write32(uintptr_t base, uint32_t offset, uint32_t value)
 {
-    __asm__ volatile("dsb ishst" ::: "memory");
     mmio_write32(base + offset, value);
     __asm__ volatile("dsb ish" ::: "memory");
 }
@@ -311,10 +310,9 @@ static void virtio_net_handle_rx_used(struct virtio_net_device *dev, size_t dev_
     /* Batch invalidate entire used ring before scanning */
     cache_invalidate_range(used, sizeof(struct vring_used) + queue_size * sizeof(struct vring_used_elem));
 
-    while (1) {
-        if (dev->rx_last_used == used->idx) {
-            break;
-        }
+    const uint16_t used_idx_snapshot = used->idx;
+
+    while (dev->rx_last_used != used_idx_snapshot) {
         uint16_t used_index = (uint16_t)(dev->rx_last_used % queue_size);
         struct vring_used_elem *elem = &used->ring[used_index];
         uint16_t desc_id = (uint16_t)elem->id;
@@ -691,7 +689,7 @@ int virtio_net_send_frame_dev(virtio_net_dev_t dev, const uint8_t *frame, size_t
 
     /* Only invalidate TX used ring when running low on slots */
     if (available_slots < (dev->tx_queue_size >> 1)) {
-        cache_invalidate_range(used, sizeof(*used));
+        cache_invalidate_range(&used->idx, sizeof(uint16_t));
         dev->tx_last_used = used->idx;
         in_flight = (uint16_t)((avail->idx - dev->tx_last_used) & 0xFFFFu);
         available_slots = (uint16_t)(dev->tx_queue_size - in_flight);
@@ -702,7 +700,7 @@ int virtio_net_send_frame_dev(virtio_net_dev_t dev, const uint8_t *frame, size_t
         uint16_t retries = 0u;
         while (available_slots < 4u && retries < 100u) {
             /* Force check the used ring again */
-            cache_invalidate_range(used, sizeof(*used));
+            cache_invalidate_range(&used->idx, sizeof(uint16_t));
             dev->tx_last_used = used->idx;
             in_flight = (uint16_t)((avail->idx - dev->tx_last_used) & 0xFFFFu);
             available_slots = (uint16_t)(dev->tx_queue_size - in_flight);
@@ -715,7 +713,7 @@ int virtio_net_send_frame_dev(virtio_net_dev_t dev, const uint8_t *frame, size_t
             /* Small delay to let device process */
             if (retries % 10u == 0u) {
                 /* Re-read used index to catch any completions */
-                cache_invalidate_range(used, sizeof(*used));
+                cache_invalidate_range(&used->idx, sizeof(uint16_t));
                 dev->tx_last_used = used->idx;
                 in_flight = (uint16_t)((avail->idx - dev->tx_last_used) & 0xFFFFu);
                 available_slots = (uint16_t)(dev->tx_queue_size - in_flight);
@@ -742,8 +740,8 @@ int virtio_net_send_frame_dev(virtio_net_dev_t dev, const uint8_t *frame, size_t
     cache_clean_range(&desc[idx], sizeof(desc[idx]));
 
     avail->ring[idx] = idx;
-    avail->idx++;
     cache_clean_range(&avail->ring[idx], sizeof(avail->ring[idx]));
+    avail->idx++;
     cache_clean_range(&avail->idx, sizeof(avail->idx));
 
     dev->tx_batch_count++;
