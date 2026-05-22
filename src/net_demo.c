@@ -880,10 +880,13 @@ static void net_rx_task(void *p_arg)
         }
 
         while (virtio_net_has_pending_rx_dev(iface->dev)) {
-            int rc = virtio_net_poll_frame_dev(iface->dev, rx_buffer, &rx_length);
-            if (rc > 0) {
-                net_demo_process_frame(iface, rx_buffer, rx_length);
-            } else if (rc < 0) {
+            uint16_t desc_id = 0u;
+            size_t len = 0u;
+            const uint8_t *frame = virtio_net_peek_rx_buffer_dev(iface->dev, &len, &desc_id);
+            if (frame != NULL && len > 0u) {
+                net_demo_process_frame(iface, frame, len);
+                virtio_net_release_rx_buffer_dev(iface->dev, desc_id);
+            } else {
                 break;
             }
         }

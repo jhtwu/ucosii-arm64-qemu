@@ -41,6 +41,8 @@ INT8U virtio_net_wait_rx_dev(virtio_net_dev_t dev, uint16_t timeout_ms);
 INT8U virtio_net_wait_rx_any(uint16_t timeout_ms);
 void virtio_net_tx_flush_dev(size_t dev_idx);
 void virtio_net_rx_flush_dev(size_t dev_idx);
+const uint8_t *virtio_net_peek_rx_buffer_dev(virtio_net_dev_t dev, size_t *out_len, uint16_t *out_desc_id);
+void virtio_net_release_rx_buffer_dev(virtio_net_dev_t dev, uint16_t desc_id);
 
 /* Legacy single-device operations (operate on device 0) */
 int virtio_net_self_test_registers(void);

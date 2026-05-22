@@ -842,6 +842,98 @@ int virtio_net_poll_frame_dev(virtio_net_dev_t dev, uint8_t *out_frame, size_t *
     return (payload_len > 0u) ? 1 : 0;
 }
 
+const uint8_t *virtio_net_peek_rx_buffer_dev(virtio_net_dev_t dev, size_t *out_len, uint16_t *out_desc_id)
+{
+    if (dev == NULL || !dev->driver_ok || out_len == NULL || out_desc_id == NULL) {
+        return NULL;
+    }
+
+    /* Find device index */
+    size_t dev_idx = 0u;
+    for (dev_idx = 0u; dev_idx < g_device_count; ++dev_idx) {
+        if (&g_devices[dev_idx] == dev) {
+            break;
+        }
+    }
+    if (dev_idx >= g_device_count) {
+        return NULL;
+    }
+
+    OS_CPU_SR cpu_sr;
+    uint16_t desc_id;
+    uint32_t total_len;
+
+    OS_ENTER_CRITICAL();
+    if (g_rx_completion_count[dev_idx] == 0u) {
+        OS_EXIT_CRITICAL();
+        return NULL;
+    }
+
+    desc_id = g_rx_completions[dev_idx][g_rx_completion_head[dev_idx]].desc_id;
+    total_len = g_rx_completions[dev_idx][g_rx_completion_head[dev_idx]].total_len;
+    OS_EXIT_CRITICAL();
+
+    if (desc_id >= dev->rx_queue_size) {
+        return NULL;
+    }
+
+    size_t payload_len = 0u;
+    if (total_len > sizeof(struct virtio_net_hdr)) {
+        payload_len = total_len - sizeof(struct virtio_net_hdr);
+        if (payload_len > VIRTIO_NET_MAX_FRAME_SIZE) {
+            payload_len = VIRTIO_NET_MAX_FRAME_SIZE;
+        }
+        cache_invalidate_range(dev->rx_buffers[desc_id], total_len);
+    }
+
+    *out_len = payload_len;
+    *out_desc_id = desc_id;
+    return dev->rx_buffers[desc_id] + sizeof(struct virtio_net_hdr);
+}
+
+void virtio_net_release_rx_buffer_dev(virtio_net_dev_t dev, uint16_t desc_id)
+{
+    if (dev == NULL || !dev->driver_ok) {
+        return;
+    }
+
+    /* Find device index */
+    size_t dev_idx = 0u;
+    for (dev_idx = 0u; dev_idx < g_device_count; ++dev_idx) {
+        if (&g_devices[dev_idx] == dev) {
+            break;
+        }
+    }
+    if (dev_idx >= g_device_count) {
+        return;
+    }
+
+    OS_CPU_SR cpu_sr;
+
+    OS_ENTER_CRITICAL();
+    if (g_rx_completion_count[dev_idx] == 0u) {
+        OS_EXIT_CRITICAL();
+        return;
+    }
+    /* Verify the head matches the released descriptor */
+    uint16_t head_desc_id = g_rx_completions[dev_idx][g_rx_completion_head[dev_idx]].desc_id;
+    if (head_desc_id != desc_id) {
+        OS_EXIT_CRITICAL();
+        uart_puts("[virtio-net] RX release desc_id mismatch\n");
+        return;
+    }
+    g_rx_completion_head[dev_idx] = (uint16_t)((g_rx_completion_head[dev_idx] + 1u) % dev->rx_queue_size);
+    g_rx_completion_count[dev_idx]--;
+    OS_EXIT_CRITICAL();
+
+    struct vring_avail *avail = dev->rx_queue->avail;
+    uint16_t avail_slot = (uint16_t)(avail->idx % dev->rx_queue_size);
+    avail->ring[avail_slot] = desc_id;
+    cache_clean_range(&avail->ring[avail_slot], sizeof(avail->ring[avail_slot]));
+    avail->idx++;
+    cache_clean_range(&avail->idx, sizeof(avail->idx));
+}
+
 const uint8_t *virtio_net_get_mac_dev(virtio_net_dev_t dev)
 {
     if (dev == NULL) {
