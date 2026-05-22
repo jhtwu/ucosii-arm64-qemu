@@ -683,13 +683,17 @@ int virtio_net_send_frame_dev(virtio_net_dev_t dev, const uint8_t *frame, size_t
     struct vring_desc *desc = queue->desc;
     uint16_t in_flight, available_slots;
 
-    /* Check and update completed TX descriptors */
-    cache_invalidate_range(used, sizeof(*used));
-    dev->tx_last_used = used->idx;
-
-    /* Calculate in-flight packets (handle wrap-around) */
+    /* Optimistic: use cached tx_last_used */
     in_flight = (uint16_t)((avail->idx - dev->tx_last_used) & 0xFFFFu);
     available_slots = (uint16_t)(dev->tx_queue_size - in_flight);
+
+    /* Only invalidate TX used ring when running low on slots */
+    if (available_slots < (dev->tx_queue_size >> 1)) {
+        cache_invalidate_range(used, sizeof(*used));
+        dev->tx_last_used = used->idx;
+        in_flight = (uint16_t)((avail->idx - dev->tx_last_used) & 0xFFFFu);
+        available_slots = (uint16_t)(dev->tx_queue_size - in_flight);
+    }
 
     /* If queue is critically full, poll for completions before giving up */
     if (available_slots < 4u) {
