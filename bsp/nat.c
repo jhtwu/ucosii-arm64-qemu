@@ -16,6 +16,9 @@ static struct nat_entry nat_table[NAT_TABLE_SIZE];
 #define NAT_HASH_SIZE 128  /* Must be power of 2 */
 static int8_t nat_hash_table[NAT_HASH_SIZE];  /* -1 = empty, >=0 = index into nat_table */
 
+/* Hash table for fast outbound lookup (protocol, lan_port -> table index) */
+static int8_t nat_outbound_hash_table[NAT_HASH_SIZE];  /* -1 = empty, >=0 = index into nat_table */
+
 /* NAT statistics */
 static struct nat_stats nat_statistics;
 
@@ -46,6 +49,9 @@ static bool ip_equal(const uint8_t ip1[4], const uint8_t ip2[4]);
 static inline uint8_t nat_hash(uint16_t wan_port);
 static void nat_hash_add(uint16_t wan_port, int table_index);
 static void nat_hash_remove(uint16_t wan_port);
+static inline uint8_t nat_outbound_hash(uint8_t protocol, uint16_t lan_port);
+static void nat_outbound_hash_add(uint8_t protocol, uint16_t lan_port, int table_index);
+static void nat_outbound_hash_remove(uint8_t protocol, uint16_t lan_port);
 
 /**
  * nat_init() - Initialize NAT subsystem
@@ -56,6 +62,7 @@ void nat_init(void)
     util_memset(&nat_statistics, 0, sizeof(nat_statistics));
     util_memset(arp_table, 0, sizeof(arp_table));
     util_memset(nat_hash_table, -1, sizeof(nat_hash_table));  /* Initialize hash table to empty */
+    util_memset(nat_outbound_hash_table, -1, sizeof(nat_outbound_hash_table));  /* Initialize outbound hash table to empty */
     next_port = nat_cfg.port_range_start;
 
     uart_puts("[NAT] Initialized: LAN=");
@@ -158,8 +165,9 @@ int nat_translate_outbound(uint8_t protocol, const uint8_t lan_ip[4], uint16_t l
     entry->last_activity = current_time;
     entry->timeout_sec = timeout;
 
-    /* Add to hash table for fast reverse lookup */
+    /* Add to hash tables for fast lookups */
     nat_hash_add(allocated_port, table_idx);
+    nat_outbound_hash_add(protocol, lan_port, table_idx);
 
     *wan_port = allocated_port;
     nat_statistics.translations_out++;
@@ -213,8 +221,9 @@ int nat_cleanup_expired(uint32_t current_ticks)
         uint32_t age_sec = current_sec - entry_sec;
 
         if (age_sec >= nat_table[i].timeout_sec) {
-            /* Remove from hash table before marking inactive */
+            /* Remove from hash tables before marking inactive */
             nat_hash_remove(nat_table[i].wan_port);
+            nat_outbound_hash_remove(nat_table[i].protocol, nat_table[i].lan_port);
 
             nat_table[i].active = false;
             removed++;
@@ -333,6 +342,23 @@ static struct nat_entry *nat_find_entry(uint8_t protocol, const uint8_t lan_ip[4
                                         uint16_t lan_port, const uint8_t dst_ip[4],
                                         uint16_t dst_port)
 {
+    /* Outbound hash table lookup - O(1) average case */
+    uint8_t hash_idx = nat_outbound_hash(protocol, lan_port);
+    int8_t table_idx = nat_outbound_hash_table[hash_idx];
+
+    if (table_idx >= 0) {
+        struct nat_entry *entry = &nat_table[table_idx];
+        if (entry->active &&
+            entry->protocol == protocol &&
+            ip_equal(entry->lan_ip, lan_ip) &&
+            entry->lan_port == lan_port &&
+            ip_equal(entry->dst_ip, dst_ip) &&
+            entry->dst_port == dst_port) {
+            return entry;
+        }
+    }
+
+    /* Fallback to linear search (hash collision or stale bucket) */
     for (int i = 0; i < NAT_TABLE_SIZE; i++) {
         if (!nat_table[i].active) {
             continue;
@@ -618,4 +644,51 @@ static void nat_hash_remove(uint16_t wan_port)
 {
     uint8_t hash_idx = nat_hash(wan_port);
     nat_hash_table[hash_idx] = -1;
+}
+
+/* ========== Outbound Hash Table Helper Functions ========== */
+
+/**
+ * nat_outbound_hash() - Compute hash index for outbound lookup
+ *
+ * @protocol: Protocol number (TCP=6, UDP=17, ICMP=1)
+ * @lan_port: LAN port number
+ *
+ * Uses simple XOR combination hashed into power-of-2 size.
+ */
+static inline uint8_t nat_outbound_hash(uint8_t protocol, uint16_t lan_port)
+{
+    uint16_t key = ((uint16_t)protocol << 8) ^ lan_port;
+    return (uint8_t)(key & (NAT_HASH_SIZE - 1));  /* Fast modulo for power of 2 */
+}
+
+/**
+ * nat_outbound_hash_add() - Add entry to outbound hash table
+ *
+ * @protocol: Protocol number
+ * @lan_port: LAN port number to hash
+ * @table_index: Index into nat_table[] for this entry
+ *
+ * Note: If there's a collision, the new entry overwrites the old one.
+ * The old entry can still be found via linear search fallback.
+ */
+static void nat_outbound_hash_add(uint8_t protocol, uint16_t lan_port, int table_index)
+{
+    uint8_t hash_idx = nat_outbound_hash(protocol, lan_port);
+    nat_outbound_hash_table[hash_idx] = (int8_t)table_index;
+}
+
+/**
+ * nat_outbound_hash_remove() - Remove entry from outbound hash table
+ *
+ * @protocol: Protocol number
+ * @lan_port: LAN port number to remove
+ *
+ * Note: Only removes if the hash bucket points to an entry with this port.
+ * Does not search for collisions.
+ */
+static void nat_outbound_hash_remove(uint8_t protocol, uint16_t lan_port)
+{
+    uint8_t hash_idx = nat_outbound_hash(protocol, lan_port);
+    nat_outbound_hash_table[hash_idx] = -1;
 }
