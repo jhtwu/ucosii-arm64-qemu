@@ -54,6 +54,7 @@
 #define VIRTIO_NET_QUEUE_SIZE           256u
 #define VIRTIO_NET_BUFFER_SIZE          2048u
 #define VIRTIO_NET_TX_BATCH_SIZE        16u   /* notify host every N queued TX frames */
+#define VIRTIO_NET_USED_RING_STRIDE     4096u /* keep each used ring 4-byte aligned */
 
 struct virtio_net_hdr {
     uint8_t flags;
@@ -118,6 +119,7 @@ struct virtio_net_device {
     uint8_t *tx_buffers[VIRTIO_NET_QUEUE_SIZE];
     OS_EVENT *rx_sem;
     uint16_t tx_batch_count;   /* frames queued but host not yet notified */
+    uint8_t rx_recycle_pending; /* RX avail updates awaiting a queue notify */
 };
 
 /* Multiple device support */
@@ -130,8 +132,13 @@ static struct vring_desc g_rx_desc[VIRTIO_NET_MAX_DEVICES][VIRTIO_NET_QUEUE_SIZE
 static struct vring_desc g_tx_desc[VIRTIO_NET_MAX_DEVICES][VIRTIO_NET_QUEUE_SIZE] __attribute__((aligned(16)));
 static struct vring_avail g_rx_avail[VIRTIO_NET_MAX_DEVICES] __attribute__((aligned(4096)));
 static struct vring_avail g_tx_avail[VIRTIO_NET_MAX_DEVICES] __attribute__((aligned(4096)));
-static struct vring_used g_rx_used[VIRTIO_NET_MAX_DEVICES] __attribute__((aligned(4096)));
-static struct vring_used g_tx_used[VIRTIO_NET_MAX_DEVICES] __attribute__((aligned(4096)));
+/* A packed used ring is 2054 bytes, so an array of structs misaligns the
+ * second device's ring.  Reserve one page per device to satisfy vhost's
+ * used-ring alignment requirement without changing the wire layout. */
+static uint8_t g_rx_used_storage[VIRTIO_NET_MAX_DEVICES][VIRTIO_NET_USED_RING_STRIDE]
+    __attribute__((aligned(4096)));
+static uint8_t g_tx_used_storage[VIRTIO_NET_MAX_DEVICES][VIRTIO_NET_USED_RING_STRIDE]
+    __attribute__((aligned(4096)));
 
 static OS_EVENT *g_rx_global_sem = NULL;
 
@@ -326,9 +333,9 @@ static void virtio_net_handle_rx_used(struct virtio_net_device *dev, size_t dev_
             uart_puts("[virtio-net] RX completion queue full\n");
             uint16_t slot = (uint16_t)(avail->idx % queue_size);
             avail->ring[slot] = desc_id;
-            cache_clean_range(&avail->ring[slot], sizeof(uint16_t));
+            cache_clean_range_nosync(&avail->ring[slot], sizeof(uint16_t));
             avail->idx++;
-            cache_clean_range(&avail->idx, sizeof(avail->idx));
+            cache_clean_range_nosync(&avail->idx, sizeof(avail->idx));
             dev->rx_last_used++;
             notify_device = 1u;
             continue;
@@ -344,6 +351,7 @@ static void virtio_net_handle_rx_used(struct virtio_net_device *dev, size_t dev_
     }
 
     if (notify_device != 0u) {
+        cache_sync();
         virtio_reg_write(dev, VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_RX_QUEUE);
     }
 
@@ -417,11 +425,11 @@ static int virtio_net_init_device(size_t dev_idx, uintptr_t base_addr, uint32_t 
 
     rx_queue->desc = g_rx_desc[dev_idx];
     rx_queue->avail = &g_rx_avail[dev_idx];
-    rx_queue->used = &g_rx_used[dev_idx];
+    rx_queue->used = (struct vring_used *)&g_rx_used_storage[dev_idx][0];
 
     tx_queue->desc = g_tx_desc[dev_idx];
     tx_queue->avail = &g_tx_avail[dev_idx];
-    tx_queue->used = &g_tx_used[dev_idx];
+    tx_queue->used = (struct vring_used *)&g_tx_used_storage[dev_idx][0];
 
     dev->rx_queue = rx_queue;
     dev->tx_queue = tx_queue;
@@ -707,7 +715,7 @@ int virtio_net_send_frame_dev(virtio_net_dev_t dev, const uint8_t *frame, size_t
             retries++;
             /* Small delay to let device process */
             if (retries % 10u == 0u) {
-                /* Re-read used index to catch any completions */
+                /* Re-read used ring to catch any completions */
                 cache_invalidate_range(used, sizeof(*used));
                 dev->tx_last_used = used->idx;
                 in_flight = (uint16_t)((avail->idx - dev->tx_last_used) & 0xFFFFu);
@@ -727,21 +735,22 @@ int virtio_net_send_frame_dev(virtio_net_dev_t dev, const uint8_t *frame, size_t
 
     util_memset(hdr, 0, sizeof(*hdr));
     util_memcpy(buffer + sizeof(*hdr), frame, length);
-    cache_clean_range(buffer, length + sizeof(*hdr));
+    cache_clean_range_nosync(buffer, length + sizeof(*hdr));
 
     desc[idx].addr = (uint64_t)(uintptr_t)buffer;
     desc[idx].len = (uint32_t)(length + sizeof(*hdr));
     desc[idx].flags = 0u;
     desc[idx].next = 0u;
-    cache_clean_range(&desc[idx], sizeof(desc[idx]));
+    cache_clean_range_nosync(&desc[idx], sizeof(desc[idx]));
 
     avail->ring[idx] = idx;
     avail->idx++;
-    cache_clean_range(&avail->ring[idx], sizeof(avail->ring[idx]));
-    cache_clean_range(&avail->idx, sizeof(avail->idx));
+    cache_clean_range_nosync(&avail->ring[idx], sizeof(avail->ring[idx]));
+    cache_clean_range_nosync(&avail->idx, sizeof(avail->idx));
 
     dev->tx_batch_count++;
     if (dev->tx_batch_count >= VIRTIO_NET_TX_BATCH_SIZE) {
+        cache_sync();
         virtio_reg_write(dev, VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_TX_QUEUE);
         dev->tx_batch_count = 0u;
     }
@@ -756,6 +765,7 @@ void virtio_net_tx_flush_dev(size_t dev_idx)
     }
     struct virtio_net_device *dev = &g_devices[dev_idx];
     if (dev->tx_batch_count > 0u) {
+        cache_sync();
         virtio_reg_write(dev, VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_TX_QUEUE);
         dev->tx_batch_count = 0u;
     }
@@ -784,7 +794,11 @@ void virtio_net_rx_flush_dev(size_t dev_idx)
     if (dev == NULL) {
         return;
     }
-    virtio_reg_write(dev, VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_RX_QUEUE);
+    if (dev->rx_recycle_pending != 0u) {
+        cache_sync();
+        virtio_reg_write(dev, VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_RX_QUEUE);
+        dev->rx_recycle_pending = 0u;
+    }
 }
 
 int virtio_net_poll_frame_dev(virtio_net_dev_t dev, uint8_t *out_frame, size_t *out_length)
@@ -849,9 +863,10 @@ int virtio_net_poll_frame_dev(virtio_net_dev_t dev, uint8_t *out_frame, size_t *
     struct vring_avail *avail = dev->rx_queue->avail;
     uint16_t avail_slot = (uint16_t)(avail->idx % dev->rx_queue_size);
     avail->ring[avail_slot] = desc_id;
-    cache_clean_range(&avail->ring[avail_slot], sizeof(avail->ring[avail_slot]));
+    cache_clean_range_nosync(&avail->ring[avail_slot], sizeof(avail->ring[avail_slot]));
     avail->idx++;
-    cache_clean_range(&avail->idx, sizeof(avail->idx));
+    cache_clean_range_nosync(&avail->idx, sizeof(avail->idx));
+    dev->rx_recycle_pending = 1u;
 
     return (payload_len > 0u) ? 1 : 0;
 }
@@ -943,9 +958,10 @@ void virtio_net_release_rx_buffer_dev(virtio_net_dev_t dev, uint16_t desc_id)
     struct vring_avail *avail = dev->rx_queue->avail;
     uint16_t avail_slot = (uint16_t)(avail->idx % dev->rx_queue_size);
     avail->ring[avail_slot] = desc_id;
-    cache_clean_range(&avail->ring[avail_slot], sizeof(avail->ring[avail_slot]));
+    cache_clean_range_nosync(&avail->ring[avail_slot], sizeof(avail->ring[avail_slot]));
     avail->idx++;
-    cache_clean_range(&avail->idx, sizeof(avail->idx));
+    cache_clean_range_nosync(&avail->idx, sizeof(avail->idx));
+    dev->rx_recycle_pending = 1u;
 }
 
 const uint8_t *virtio_net_get_mac_dev(virtio_net_dev_t dev)

@@ -189,6 +189,57 @@ static uint16_t tcp_udp_checksum(const struct ipv4_header *ip, const void *trans
     return (uint16_t)~sum;
 }
 
+/*
+ * Update an Internet checksum after replacing one 16-bit field.
+ *
+ * Header fields are stored in network byte order.  The checksum routines in
+ * this file return the value in the representation used by those packed
+ * fields, so convert to host order for the RFC 1624 arithmetic and convert
+ * back before storing the result.
+ */
+static uint16_t checksum_replace16(uint16_t checksum,
+                                   uint16_t old_value,
+                                   uint16_t new_value)
+{
+    uint32_t sum = (uint32_t)(~util_ntohs(checksum) & 0xFFFFu);
+
+    sum += (uint32_t)(~util_ntohs(old_value) & 0xFFFFu);
+    sum += (uint32_t)util_ntohs(new_value);
+
+    while ((sum >> 16u) != 0u) {
+        sum = (sum & 0xFFFFu) + (sum >> 16u);
+    }
+
+    return util_htons((uint16_t)~sum);
+}
+
+static uint16_t checksum_replace32(uint16_t checksum,
+                                   const uint8_t old_value[4],
+                                   const uint8_t new_value[4])
+{
+    uint16_t old_word;
+    uint16_t new_word;
+
+    old_word = (uint16_t)(((uint16_t)old_value[0] << 8u) | old_value[1]);
+    new_word = (uint16_t)(((uint16_t)new_value[0] << 8u) | new_value[1]);
+    checksum = checksum_replace16(checksum, util_htons(old_word), util_htons(new_word));
+
+    old_word = (uint16_t)(((uint16_t)old_value[2] << 8u) | old_value[3]);
+    new_word = (uint16_t)(((uint16_t)new_value[2] << 8u) | new_value[3]);
+    return checksum_replace16(checksum, util_htons(old_word), util_htons(new_word));
+}
+
+static uint16_t checksum_replace_ttl(uint16_t checksum,
+                                     uint8_t old_ttl,
+                                     uint8_t new_ttl,
+                                     uint8_t protocol)
+{
+    uint16_t old_word = (uint16_t)(((uint16_t)old_ttl << 8u) | protocol);
+    uint16_t new_word = (uint16_t)(((uint16_t)new_ttl << 8u) | protocol);
+
+    return checksum_replace16(checksum, util_htons(old_word), util_htons(new_word));
+}
+
 static bool ip_equals(const uint8_t *lhs, const uint8_t *rhs)
 {
     return (util_memcmp(lhs, rhs, 4u) == 0);
@@ -516,20 +567,36 @@ static int net_demo_process_frame(struct net_interface *iface,
                         }
 
                         /* Update IP header */
+                        uint8_t old_dst_ip[4];
+                        uint16_t old_ip_checksum = fwd_ip->header_checksum;
+                        uint8_t old_ttl = fwd_ip->ttl;
+                        util_memcpy(old_dst_ip, fwd_ip->dst, sizeof(old_dst_ip));
                         util_memcpy(fwd_ip->dst, lan_ip, 4);
                         fwd_ip->ttl--;
-                        fwd_ip->header_checksum = 0u;
-                        fwd_ip->header_checksum = util_htons(checksum16(fwd_ip, ip_header_len));
 
                         /* Update transport port and checksum */
                         if (ip->protocol == 6u) {
                             struct tcp_header *fwd_tcp = (struct tcp_header *)((uint8_t *)fwd_ip + ip_header_len);
+                            uint16_t old_dst_port = fwd_tcp->dst_port;
+
+                            fwd_ip->header_checksum = checksum_replace32(old_ip_checksum,
+                                                                          old_dst_ip,
+                                                                          fwd_ip->dst);
+                            fwd_ip->header_checksum = checksum_replace_ttl(fwd_ip->header_checksum,
+                                                                            old_ttl,
+                                                                            fwd_ip->ttl,
+                                                                            fwd_ip->protocol);
                             fwd_tcp->dst_port = util_htons(lan_port);
-                            fwd_tcp->checksum = 0u;
-                            size_t tcp_len = total_length - ip_header_len;
-                            fwd_tcp->checksum = tcp_udp_checksum(fwd_ip, fwd_tcp, tcp_len);  /* Direct assignment */
+                            fwd_tcp->checksum = checksum_replace32(fwd_tcp->checksum,
+                                                                   old_dst_ip,
+                                                                   fwd_ip->dst);
+                            fwd_tcp->checksum = checksum_replace16(fwd_tcp->checksum,
+                                                                    old_dst_port,
+                                                                    fwd_tcp->dst_port);
                         } else {
                             struct udp_header *fwd_udp = (struct udp_header *)((uint8_t *)fwd_ip + ip_header_len);
+                            fwd_ip->header_checksum = 0u;
+                            fwd_ip->header_checksum = util_htons(checksum16(fwd_ip, ip_header_len));
                             fwd_udp->dst_port = util_htons(lan_port);
                             fwd_udp->checksum = 0u;
                             size_t udp_len = total_length - ip_header_len;
@@ -664,20 +731,36 @@ static int net_demo_process_frame(struct net_interface *iface,
                                 }
 
                                 /* Update IP header */
+                                uint8_t old_src_ip[4];
+                                uint16_t old_ip_checksum = fwd_ip->header_checksum;
+                                uint8_t old_ttl = fwd_ip->ttl;
+                                util_memcpy(old_src_ip, fwd_ip->src, sizeof(old_src_ip));
                                 util_memcpy(fwd_ip->src, g_wan_if.local_ip, 4);
                                 fwd_ip->ttl--;
-                                fwd_ip->header_checksum = 0u;
-                                fwd_ip->header_checksum = util_htons(checksum16(fwd_ip, ip_header_len));
 
                                 /* Update transport port and checksum */
                                 if (ip->protocol == 6u) {
                                     struct tcp_header *fwd_tcp = (struct tcp_header *)((uint8_t *)fwd_ip + ip_header_len);
+                                    uint16_t old_src_port = fwd_tcp->src_port;
+
+                                    fwd_ip->header_checksum = checksum_replace32(old_ip_checksum,
+                                                                                  old_src_ip,
+                                                                                  fwd_ip->src);
+                                    fwd_ip->header_checksum = checksum_replace_ttl(fwd_ip->header_checksum,
+                                                                                    old_ttl,
+                                                                                    fwd_ip->ttl,
+                                                                                    fwd_ip->protocol);
                                     fwd_tcp->src_port = util_htons(wan_port);
-                                    fwd_tcp->checksum = 0u;
-                                    size_t tcp_len = total_length - ip_header_len;
-                                    fwd_tcp->checksum = tcp_udp_checksum(fwd_ip, fwd_tcp, tcp_len);
+                                    fwd_tcp->checksum = checksum_replace32(fwd_tcp->checksum,
+                                                                           old_src_ip,
+                                                                           fwd_ip->src);
+                                    fwd_tcp->checksum = checksum_replace16(fwd_tcp->checksum,
+                                                                            old_src_port,
+                                                                            fwd_tcp->src_port);
                                 } else {
                                     struct udp_header *fwd_udp = (struct udp_header *)((uint8_t *)fwd_ip + ip_header_len);
+                                    fwd_ip->header_checksum = 0u;
+                                    fwd_ip->header_checksum = util_htons(checksum16(fwd_ip, ip_header_len));
                                     fwd_udp->src_port = util_htons(wan_port);
                                     fwd_udp->checksum = 0u;
                                     size_t udp_len = total_length - ip_header_len;
@@ -787,20 +870,36 @@ static int net_demo_process_frame(struct net_interface *iface,
                                 }
 
                                 /* Update IP header */
+                                uint8_t old_dst_ip[4];
+                                uint16_t old_ip_checksum = fwd_ip->header_checksum;
+                                uint8_t old_ttl = fwd_ip->ttl;
+                                util_memcpy(old_dst_ip, fwd_ip->dst, sizeof(old_dst_ip));
                                 util_memcpy(fwd_ip->dst, lan_ip, 4);
                                 fwd_ip->ttl--;
-                                fwd_ip->header_checksum = 0u;
-                                fwd_ip->header_checksum = util_htons(checksum16(fwd_ip, ip_header_len));
 
                                 /* Update transport port and checksum */
                                 if (ip->protocol == 6u) {
                                     struct tcp_header *fwd_tcp = (struct tcp_header *)((uint8_t *)fwd_ip + ip_header_len);
+                                    uint16_t old_dst_port = fwd_tcp->dst_port;
+
+                                    fwd_ip->header_checksum = checksum_replace32(old_ip_checksum,
+                                                                                  old_dst_ip,
+                                                                                  fwd_ip->dst);
+                                    fwd_ip->header_checksum = checksum_replace_ttl(fwd_ip->header_checksum,
+                                                                                    old_ttl,
+                                                                                    fwd_ip->ttl,
+                                                                                    fwd_ip->protocol);
                                     fwd_tcp->dst_port = util_htons(lan_port);
-                                    fwd_tcp->checksum = 0u;
-                                    size_t tcp_len = total_length - ip_header_len;
-                                    fwd_tcp->checksum = tcp_udp_checksum(fwd_ip, fwd_tcp, tcp_len);  /* Direct assignment */
+                                    fwd_tcp->checksum = checksum_replace32(fwd_tcp->checksum,
+                                                                           old_dst_ip,
+                                                                           fwd_ip->dst);
+                                    fwd_tcp->checksum = checksum_replace16(fwd_tcp->checksum,
+                                                                            old_dst_port,
+                                                                            fwd_tcp->dst_port);
                                 } else {
                                     struct udp_header *fwd_udp = (struct udp_header *)((uint8_t *)fwd_ip + ip_header_len);
+                                    fwd_ip->header_checksum = 0u;
+                                    fwd_ip->header_checksum = util_htons(checksum16(fwd_ip, ip_header_len));
                                     fwd_udp->dst_port = util_htons(lan_port);
                                     fwd_udp->checksum = 0u;
                                     size_t udp_len = total_length - ip_header_len;

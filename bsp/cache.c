@@ -36,7 +36,7 @@ static void dc_civac(uintptr_t addr)
     __asm__ volatile("dc civac, %0" :: "r"(addr) : "memory");
 }
 
-void cache_clean_range(const void *addr, size_t size)
+void cache_clean_range_nosync(const void *addr, size_t size)
 {
     if (size == 0u) {
         return;
@@ -46,8 +46,17 @@ void cache_clean_range(const void *addr, size_t size)
     uintptr_t end = align_up((uintptr_t)addr + size);
 
     cache_op_range(start, end, dc_cvac);
+}
 
+void cache_sync(void)
+{
     __asm__ volatile("dsb ish" ::: "memory");
+}
+
+void cache_clean_range(const void *addr, size_t size)
+{
+    cache_clean_range_nosync(addr, size);
+    cache_sync();
 }
 
 void cache_invalidate_range(void *addr, size_t size)
