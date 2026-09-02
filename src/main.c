@@ -19,6 +19,7 @@
 #include "bsp_int.h"
 #include "bsp_os.h"
 #include "net_demo.h"
+#include "app_cfg.h"
 
 #define BUSY_DELAY          (2000u)
 #define TASK_STACK_SIZE     512u
@@ -76,13 +77,14 @@ static void task_b(void *p_arg)
 int main(void)
 {
     /*
-     * 中文：系統啟動步驟：初始化 UART、呼叫 OSInit、建立兩個任務並預先暫停 Task B，然後啟動排程器。
-     * English: Boot steps: initialise UART, call OSInit, spawn both tasks with Task B initially suspended, then start the scheduler.
+     * 中文：系統啟動步驟：依設定初始化 UART、呼叫 OSInit、建立兩個任務，然後啟動排程器。
+     * English: Boot steps: optionally initialise UART, call OSInit, spawn two tasks, then start the scheduler.
      */
+    /* QEMU/KVM normally provides an already configured PL011 UART. */
+#if APP_CFG_UART_REINIT
+    uart_init();
+#endif
     uart_puts("[BOOT] main enter\n");
-    /* uart_init() skipped: QEMU PL011 TXFF latches incorrectly after UARTLCRH
-     * FEN-enable + UARTCR re-enable sequence under KVM without intervening
-     * KVM exits.  QEMU's UART already works from its reset state. */
     uart_puts("\n[BOOT] uC/OS-II ARMv8 demo starting\n");
 
     uart_puts("[BOOT] Initialising GICv3\n");

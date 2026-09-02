@@ -35,6 +35,7 @@
 #include "timer.h"
 #include "bsp_int.h"
 #include "bsp_os.h"
+#include "app_cfg.h"
 
 #define TASK_STACK_SIZE         512u
 #define TEST_NET_TASK_PRIO      3u
@@ -179,6 +180,7 @@ static void send_arp_request(void)
 
     uart_puts("[TEST] Sending ARP request for 192.168.1.103\n");
     virtio_net_send_frame(frame, sizeof(*eth) + sizeof(*arp));
+    virtio_net_tx_flush_dev(0u);
 }
 
 static void send_icmp_request(uint16_t sequence)
@@ -235,6 +237,7 @@ static void send_icmp_request(uint16_t sequence)
 
     size_t frame_len = sizeof(struct eth_header) + total_length;
     virtio_net_send_frame(frame, frame_len);
+    virtio_net_tx_flush_dev(0u);
 }
 
 static int process_frame(const uint8_t *frame, size_t length)
@@ -518,7 +521,9 @@ int main(void)
     uart_puts("========================================\n");
     uart_puts("[BOOT] Initializing test environment\n");
 
+#if APP_CFG_UART_REINIT
     uart_init();
+#endif
     gic_init();
     uart_puts("[BOOT] GICv3 initialized\n");
 

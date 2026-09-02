@@ -238,6 +238,7 @@ static void net_demo_send_arp_request(struct net_interface *iface)
     uart_putc((char)('0' + iface->peer_ip[3] % 10u));
     uart_putc('\n');
     virtio_net_send_frame_dev(iface->dev, frame, sizeof(*eth) + sizeof(*arp));
+    virtio_net_tx_flush_device(iface->dev);
 }
 
 static void send_arp_request_for_ip(struct net_interface *iface, const uint8_t target_ip[4])
@@ -265,6 +266,7 @@ static void send_arp_request_for_ip(struct net_interface *iface, const uint8_t t
     util_memcpy(arp->tpa, target_ip, sizeof(arp->tpa));
 
     virtio_net_send_frame_dev(iface->dev, frame, sizeof(*eth) + sizeof(*arp));
+    virtio_net_tx_flush_device(iface->dev);
 }
 
 static void send_arp_reply(struct net_interface *iface,
@@ -291,6 +293,7 @@ static void send_arp_reply(struct net_interface *iface,
     util_memcpy(reply_arp->tpa, request->spa, sizeof(reply_arp->tpa));
 
     virtio_net_send_frame_dev(iface->dev, frame, sizeof(*reply_eth) + sizeof(*reply_arp));
+    virtio_net_tx_flush_device(iface->dev);
 }
 
 static void send_icmp_echo_reply(struct net_interface *iface,
@@ -348,6 +351,7 @@ static void send_icmp_echo_reply(struct net_interface *iface,
     uart_write_dec(original_dst_ip[3]);
     uart_puts(")\n");
     virtio_net_send_frame_dev(iface->dev, frame, sizeof(*eth) + payload_len);
+    virtio_net_tx_flush_device(iface->dev);
 
     /* Restore original src MAC in case buffer reused */
     util_memcpy(eth->src, original_src_mac, sizeof(original_src_mac));
@@ -865,6 +869,7 @@ static void net_demo_send_icmp_request(struct net_interface *iface, uint16_t seq
     uart_puts(": Sending ICMP echo request\n");
     size_t frame_len = sizeof(struct eth_header) + total_length;
     virtio_net_send_frame_dev(iface->dev, frame, frame_len);
+    virtio_net_tx_flush_device(iface->dev);
 }
 
 static void net_rx_task(void *p_arg)

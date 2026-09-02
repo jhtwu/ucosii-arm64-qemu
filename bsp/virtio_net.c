@@ -761,6 +761,20 @@ void virtio_net_tx_flush_dev(size_t dev_idx)
     }
 }
 
+void virtio_net_tx_flush_device(virtio_net_dev_t dev)
+{
+    if (dev == NULL) {
+        return;
+    }
+
+    for (size_t dev_idx = 0u; dev_idx < g_device_count; ++dev_idx) {
+        if (&g_devices[dev_idx] == dev) {
+            virtio_net_tx_flush_dev(dev_idx);
+            return;
+        }
+    }
+}
+
 void virtio_net_rx_flush_dev(size_t dev_idx)
 {
     if (dev_idx >= VIRTIO_NET_MAX_DEVICES) {

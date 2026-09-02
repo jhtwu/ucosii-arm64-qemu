@@ -30,6 +30,7 @@
 #include "mmio.h"
 #include "bsp_int.h"
 #include "bsp_os.h"
+#include "app_cfg.h"
 
 #define TASK_STACK_SIZE     512u
 #define TEST_TASK_A_PRIO    3u
@@ -168,7 +169,9 @@ int main(void)
     uart_puts("========================================\n");
     uart_puts("[BOOT] Initializing test environment\n");
 
+#if APP_CFG_UART_REINIT
     uart_init();
+#endif
     gic_init();
     uart_puts("[BOOT] GICv3 initialized\n");
 

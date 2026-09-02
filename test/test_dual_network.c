@@ -8,6 +8,7 @@
 #include "bsp_int.h"
 #include "virtio_net.h"
 #include "lib.h"
+#include "app_cfg.h"
 
 #define TASK_STK_SIZE 4096u
 
@@ -121,9 +122,11 @@ static int send_arp_request(virtio_net_dev_t dev, const uint8_t *src_mac,
     util_memset(arp->target_mac, 0, 6);
     util_memcpy(arp->target_ip, target_ip, 4);
 
-    return virtio_net_send_frame_dev(dev, (const uint8_t *)&frame,
-                                     sizeof(frame.dst_mac) + sizeof(frame.src_mac) +
-                                     sizeof(frame.ethertype) + sizeof(struct arp_packet));
+    int rc = virtio_net_send_frame_dev(dev, (const uint8_t *)&frame,
+                                       sizeof(frame.dst_mac) + sizeof(frame.src_mac) +
+                                       sizeof(frame.ethertype) + sizeof(struct arp_packet));
+    virtio_net_tx_flush_device(dev);
+    return rc;
 }
 
 static int send_icmp_echo(virtio_net_dev_t dev, const uint8_t *src_mac, const uint8_t *dst_mac,
@@ -159,10 +162,12 @@ static int send_icmp_echo(virtio_net_dev_t dev, const uint8_t *src_mac, const ui
     util_memset(icmp->data, 0xAA, sizeof(icmp->data));
     icmp->checksum = checksum(icmp, sizeof(struct icmp_echo));
 
-    return virtio_net_send_frame_dev(dev, (const uint8_t *)&frame,
-                                     sizeof(frame.dst_mac) + sizeof(frame.src_mac) +
-                                     sizeof(frame.ethertype) + sizeof(struct ip_header) +
-                                     sizeof(struct icmp_echo));
+    int rc = virtio_net_send_frame_dev(dev, (const uint8_t *)&frame,
+                                       sizeof(frame.dst_mac) + sizeof(frame.src_mac) +
+                                       sizeof(frame.ethertype) + sizeof(struct ip_header) +
+                                       sizeof(struct icmp_echo));
+    virtio_net_tx_flush_device(dev);
+    return rc;
 }
 
 static void net_test_task(void *p_arg)
@@ -368,8 +373,10 @@ int main(void)
     uart_puts("========================================\n");
     uart_puts("[BOOT] Initializing test environment\n");
 
+#if APP_CFG_UART_REINIT
     /* Initialize hardware */
     uart_init();
+#endif
     gic_init();
     uart_puts("[BOOT] GICv3 initialized\n");
 
