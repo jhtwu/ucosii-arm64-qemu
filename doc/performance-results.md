@@ -23,6 +23,7 @@
 | Used-ring page alignment，解除 vhost fallback | 273.0 → 856.3 Mbps | **+213.7%** | 430.7 → 983.3 Mbps | **+128.3%** | **採用；本次最大且穩定的改善** |
 | TX used-index-only polling | 862.3 → 875.7 Mbps | 約 +1.5% | 1006.7 → 1050 Mbps | 約 +4.3% | 採用；降低每包 cache invalidate 範圍，但增益小於量測波動，需持續以多輪 A/B 觀察 |
 | RX IRQ minimal + task poll | full ISR 不可持續 → 835 Mbps | N/A† | full ISR 未完成 → 975 Mbps | N/A† | **採用候選；將 RX used-ring drain 移到 task，避免單 vCPU 被 IRQ drain 佔滿** |
+| RX used-ring incremental invalidate | 850.0 → 852.0 Mbps | 約 +0.2% | 1003.5 → 988.7 Mbps | 約 -1.5% | 正確性與 cache 工作量改善，但 throughput 未見可辨識增益，暫不宣稱效能提升 |
 | RX buffer zero-copy forwarding candidate | 845.0 → 520.5 Mbps | -38.4% | 1030.0 → 346.0 Mbps | -66.4% | 不採用，已撤回未提交改動 |
 
 † Full-ISR baseline 在本次同條件測試中前 4–5 秒約 770–895 Mbps，之後降為 0 並 timeout，因此沒有可與完整 10 秒 task-poll 結果直接計算的 steady-state baseline；N/A 不代表沒有改善，而是 baseline 沒有完成可比測量。
@@ -56,6 +57,10 @@
 
 同樣使用 BPI-R4 KVM/vhost、1 vCPU、TCP single stream、每方向 10 秒。Deferred image 的 TX/RX 分別為 **835 Mbps / 975 Mbps**，client/server 均正常完成；full-ISR baseline 在短暫高 throughput 後卡住，TX 測試 timeout，reverse-RX 無法完成。因此這項優化目前以「恢復可持續 throughput」為主要成果，不能用失敗的 baseline 直接宣稱固定百分比。
 
+### RX used-ring incremental invalidate 的 BPI A/B 數據
+
+這組比較固定使用已採用的 task-poll 模式，只改變 RX used-ring cache invalidate 範圍：baseline 每次 invalidate 整個 used ring；新版本先讀取 `used->idx`，只 invalidate 自上次 drain 以來新增的 entries，並處理 ring wrap。Baseline 跑 2 次、新版本跑 3 次，結果分別為 TX **850.0 → 852.0 Mbps**、RX **1003.5 → 988.7 Mbps**；差異落在量測波動內，沒有可辨識的 throughput 改善。
+
 ## 未獨立量測的既有調整
 
 以下功能在本次量測開始前已存在於 branch，沒有相同條件的獨立 baseline，因此不填造改善百分比：
@@ -77,4 +82,4 @@
 
 ## Current decision
 
-目前保留並已 push 的主要效能修正是 used-ring alignment、cache ordering 調整與 checksum path；used-index-only polling 與 RX IRQ minimal + task poll 已完成本地與 BPI A/B 測試，尚未 commit/push。zero-copy forwarding 只完成候選實驗，因為在 BPI 實測明顯降低 throughput，已撤回，不會進入正式版本。
+目前保留並已 push 的主要效能修正是 used-ring alignment、cache ordering 調整與 checksum path；used-index-only polling 與 RX IRQ minimal + task poll 已完成本地與 BPI A/B 測試，尚未 commit/push。RX used-ring incremental invalidate 已完成 review、build 與 BPI A/B，正確但暫未證明 throughput 收益，尚未 commit/push。zero-copy forwarding 只完成候選實驗，因為在 BPI 實測明顯降低 throughput，已撤回，不會進入正式版本。

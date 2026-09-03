@@ -303,10 +303,43 @@ static void virtio_net_prepare_tx(struct virtio_net_device *dev, size_t dev_idx)
     cache_clean_range(queue->used, sizeof(*queue->used));
 }
 
+static uint16_t virtio_net_read_rx_used_idx(struct virtio_net_device *dev)
+{
+    struct vring_used *used = dev->rx_queue->used;
+
+    /* The device publishes used entries by updating idx after the entries. */
+    cache_invalidate_range(&used->idx, sizeof(used->idx));
+    return used->idx;
+}
+
+static void virtio_net_invalidate_rx_used_entries(struct virtio_net_device *dev,
+                                                  uint16_t first_used,
+                                                  uint16_t pending)
+{
+    struct vring_used *used = dev->rx_queue->used;
+    uint16_t queue_size = dev->rx_queue_size;
+    uint16_t cursor = first_used;
+
+    while (pending != 0u) {
+        uint16_t ring_index = (uint16_t)(cursor % queue_size);
+        uint16_t chunk = (uint16_t)(queue_size - ring_index);
+        if (chunk > pending) {
+            chunk = pending;
+        }
+
+        cache_invalidate_range(&used->ring[ring_index],
+                               (size_t)chunk * sizeof(struct vring_used_elem));
+        cursor = (uint16_t)(cursor + chunk);
+        pending = (uint16_t)(pending - chunk);
+    }
+}
+
 static int virtio_net_drain_rx_used(struct virtio_net_device *dev, size_t dev_idx)
 {
     struct virtio_queue *queue = dev->rx_queue;
     uint16_t queue_size = dev->rx_queue_size;
+    uint16_t used_idx;
+    uint16_t pending;
     uint8_t notify_device = 0u;
     int enqueued = 0;
     struct vring_used *used = queue->used;
@@ -316,13 +349,25 @@ static int virtio_net_drain_rx_used(struct virtio_net_device *dev, size_t dev_id
         return 0;
     }
 
-    /* Keep the existing full used-ring invalidation for this A/B test; the
-     * only intended variable is whether this drain runs in IRQ or task code. */
-    cache_invalidate_range(used, sizeof(struct vring_used) +
-                           queue_size * sizeof(struct vring_used_elem));
+    used_idx = virtio_net_read_rx_used_idx(dev);
+    if (dev->rx_last_used == used_idx) {
+        return 0;
+    }
+
+    pending = (uint16_t)(used_idx - dev->rx_last_used);
+    if (pending > queue_size) {
+        /* More completions than descriptors means the used ring was
+         * overwritten or its index is corrupt; do not spin around it. */
+        uart_puts("[virtio-net] RX used ring overrun\n");
+        dev->rx_last_used = used_idx;
+        return -1;
+    }
+
+    /* Invalidate only entries published since the previous drain. */
+    virtio_net_invalidate_rx_used_entries(dev, dev->rx_last_used, pending);
 
     while (1) {
-        if (dev->rx_last_used == used->idx) {
+        if (dev->rx_last_used == used_idx) {
             break;
         }
         uint16_t used_index = (uint16_t)(dev->rx_last_used % queue_size);
