@@ -13,6 +13,11 @@
 
 #define VIRTIO_NET_MAX_FRAME_SIZE      1518u
 
+/* 1: IRQ only signals and the RX task polls the used ring; 0: ISR drains it. */
+#ifndef VIRTIO_NET_RX_DEFER_POLL
+#define VIRTIO_NET_RX_DEFER_POLL        1u
+#endif
+
 /* Maximum number of VirtIO network devices supported */
 #define VIRTIO_NET_MAX_DEVICES         2u
 
@@ -33,6 +38,7 @@ size_t virtio_net_get_device_count(void);
 
 /* Device-specific operations */
 int virtio_net_send_frame_dev(virtio_net_dev_t dev, const uint8_t *frame, size_t length);
+int virtio_net_poll_rx_dev(virtio_net_dev_t dev);
 int virtio_net_poll_frame_dev(virtio_net_dev_t dev, uint8_t *out_frame, size_t *out_length);
 const uint8_t *virtio_net_get_mac_dev(virtio_net_dev_t dev);
 void virtio_net_enable_interrupts_dev(virtio_net_dev_t dev);

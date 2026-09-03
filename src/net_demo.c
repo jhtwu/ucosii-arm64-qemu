@@ -983,6 +983,10 @@ static void net_rx_task(void *p_arg)
             continue;
         }
 
+        /* Deferred mode lets the task drain the VirtIO RX used ring. */
+#if VIRTIO_NET_RX_DEFER_POLL
+        (void)virtio_net_poll_rx_dev(iface->dev);
+#endif
         while (virtio_net_has_pending_rx_dev(iface->dev)) {
             uint16_t desc_id = 0u;
             size_t len = 0u;

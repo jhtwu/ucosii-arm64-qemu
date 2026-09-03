@@ -303,17 +303,23 @@ static void virtio_net_prepare_tx(struct virtio_net_device *dev, size_t dev_idx)
     cache_clean_range(queue->used, sizeof(*queue->used));
 }
 
-static void virtio_net_handle_rx_used(struct virtio_net_device *dev, size_t dev_idx)
+static int virtio_net_drain_rx_used(struct virtio_net_device *dev, size_t dev_idx)
 {
     struct virtio_queue *queue = dev->rx_queue;
     uint16_t queue_size = dev->rx_queue_size;
     uint8_t notify_device = 0u;
-    uint8_t enqueued = 0u;
+    int enqueued = 0;
     struct vring_used *used = queue->used;
     struct vring_avail *avail = queue->avail;
 
-    /* Batch invalidate entire used ring before scanning */
-    cache_invalidate_range(used, sizeof(struct vring_used) + queue_size * sizeof(struct vring_used_elem));
+    if (queue_size == 0u) {
+        return 0;
+    }
+
+    /* Keep the existing full used-ring invalidation for this A/B test; the
+     * only intended variable is whether this drain runs in IRQ or task code. */
+    cache_invalidate_range(used, sizeof(struct vring_used) +
+                           queue_size * sizeof(struct vring_used_elem));
 
     while (1) {
         if (dev->rx_last_used == used->idx) {
@@ -345,7 +351,7 @@ static void virtio_net_handle_rx_used(struct virtio_net_device *dev, size_t dev_
         g_rx_completions[dev_idx][g_rx_completion_tail[dev_idx]].total_len = elem->len;
         g_rx_completion_tail[dev_idx] = (uint16_t)((g_rx_completion_tail[dev_idx] + 1u) % queue_size);
         g_rx_completion_count[dev_idx]++;
-        enqueued = 1u;
+        enqueued++;
 
         dev->rx_last_used++;
     }
@@ -355,15 +361,36 @@ static void virtio_net_handle_rx_used(struct virtio_net_device *dev, size_t dev_
         virtio_reg_write(dev, VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_RX_QUEUE);
     }
 
-    if (enqueued != 0u) {
-        if (dev->rx_sem != NULL) {
-            OSSemPost(dev->rx_sem);
-        }
-        if (g_rx_global_sem != NULL) {
-            OSSemPost(g_rx_global_sem);
+    return enqueued;
+}
+
+static int virtio_net_find_device_index(virtio_net_dev_t dev, size_t *dev_idx_out)
+{
+    if (dev == NULL || dev_idx_out == NULL) {
+        return -1;
+    }
+
+    for (size_t i = 0u; i < g_device_count; ++i) {
+        if (&g_devices[i] == dev) {
+            *dev_idx_out = i;
+            return 0;
         }
     }
 
+    return -1;
+}
+
+/* Drain device-written RX completions from task context. */
+int virtio_net_poll_rx_dev(virtio_net_dev_t dev)
+{
+    size_t dev_idx;
+
+    if (dev == NULL || !dev->driver_ok ||
+        virtio_net_find_device_index(dev, &dev_idx) != 0) {
+        return -1;
+    }
+
+    return virtio_net_drain_rx_used(dev, dev_idx);
 }
 
 static int virtio_net_configure_queue(struct virtio_net_device *dev,
@@ -409,6 +436,17 @@ static int virtio_net_configure_queue(struct virtio_net_device *dev,
 
     *queue_size_out = queue_size;
     return 0;
+}
+
+/* The TX path only needs the device-written used index to reclaim queue
+ * capacity.  Invalidating the complete used ring here costs dozens of cache
+ * lines per packet and provides no information used by the driver. */
+static uint16_t virtio_net_read_tx_used_idx(struct virtio_net_device *dev)
+{
+    struct vring_used *used = dev->tx_queue->used;
+
+    cache_invalidate_range(&used->idx, sizeof(used->idx));
+    return used->idx;
 }
 
 static int virtio_net_init_device(size_t dev_idx, uintptr_t base_addr, uint32_t irq)
@@ -685,14 +723,12 @@ int virtio_net_send_frame_dev(virtio_net_dev_t dev, const uint8_t *frame, size_t
     }
 
     struct virtio_queue *queue = dev->tx_queue;
-    struct vring_used *used = queue->used;
     struct vring_avail *avail = queue->avail;
     struct vring_desc *desc = queue->desc;
     uint16_t in_flight, available_slots;
 
     /* Check and update completed TX descriptors */
-    cache_invalidate_range(used, sizeof(*used));
-    dev->tx_last_used = used->idx;
+    dev->tx_last_used = virtio_net_read_tx_used_idx(dev);
 
     /* Calculate in-flight packets (handle wrap-around) */
     in_flight = (uint16_t)((avail->idx - dev->tx_last_used) & 0xFFFFu);
@@ -703,8 +739,7 @@ int virtio_net_send_frame_dev(virtio_net_dev_t dev, const uint8_t *frame, size_t
         uint16_t retries = 0u;
         while (available_slots < 4u && retries < 100u) {
             /* Force check the used ring again */
-            cache_invalidate_range(used, sizeof(*used));
-            dev->tx_last_used = used->idx;
+            dev->tx_last_used = virtio_net_read_tx_used_idx(dev);
             in_flight = (uint16_t)((avail->idx - dev->tx_last_used) & 0xFFFFu);
             available_slots = (uint16_t)(dev->tx_queue_size - in_flight);
 
@@ -716,8 +751,7 @@ int virtio_net_send_frame_dev(virtio_net_dev_t dev, const uint8_t *frame, size_t
             /* Small delay to let device process */
             if (retries % 10u == 0u) {
                 /* Re-read used ring to catch any completions */
-                cache_invalidate_range(used, sizeof(*used));
-                dev->tx_last_used = used->idx;
+                dev->tx_last_used = virtio_net_read_tx_used_idx(dev);
                 in_flight = (uint16_t)((avail->idx - dev->tx_last_used) & 0xFFFFu);
                 available_slots = (uint16_t)(dev->tx_queue_size - in_flight);
             }
@@ -807,14 +841,13 @@ int virtio_net_poll_frame_dev(virtio_net_dev_t dev, uint8_t *out_frame, size_t *
         return -1;
     }
 
-    /* Find device index */
-    size_t dev_idx = 0u;
-    for (dev_idx = 0u; dev_idx < g_device_count; ++dev_idx) {
-        if (&g_devices[dev_idx] == dev) {
-            break;
-        }
+    /* Preserve the direct polling API used by the standalone tests. */
+    if (!virtio_net_has_pending_rx_dev(dev)) {
+        (void)virtio_net_poll_rx_dev(dev);
     }
-    if (dev_idx >= g_device_count) {
+
+    size_t dev_idx;
+    if (virtio_net_find_device_index(dev, &dev_idx) != 0) {
         return -1;
     }
 
@@ -1153,20 +1186,50 @@ void virtio_net_interrupt_handler(uint32_t int_id)
         return;
     }
 
-    /* Read interrupt status */
+    /* Keep the RX ring out of the ISR in deferred mode.  The non-deferred
+     * build intentionally retains the original drain-before-ACK ordering so
+     * the benchmark compares only the RX work placement. */
     interrupt_status = virtio_reg_read(dev, VIRTIO_MMIO_INTERRUPT_STATUS);
 
-    if (interrupt_status & 0x1u) {  /* Used buffer notification */
-        if (dev->tx_queue != NULL) {
-            cache_invalidate_range(dev->tx_queue->used, sizeof(*dev->tx_queue->used));
-            dev->tx_last_used = dev->tx_queue->used->idx;
-        }
-
-        virtio_net_handle_rx_used(dev, dev_idx);
+    if (interrupt_status == 0u) {
+        return;
     }
 
-    /* Acknowledge interrupt */
+#if VIRTIO_NET_RX_DEFER_POLL
+    if (interrupt_status & 0x1u) {  /* Used buffer notification */
+        if (dev->tx_queue != NULL) {
+            dev->tx_last_used = virtio_net_read_tx_used_idx(dev);
+        }
+
+        /* Acknowledge before waking the task; it owns RX used-ring polling. */
+        virtio_reg_write(dev, VIRTIO_MMIO_INTERRUPT_ACK, interrupt_status);
+        if (dev->rx_sem != NULL) {
+            OSSemPost(dev->rx_sem);
+        }
+        if (g_rx_global_sem != NULL) {
+            OSSemPost(g_rx_global_sem);
+        }
+    } else {
+        virtio_reg_write(dev, VIRTIO_MMIO_INTERRUPT_ACK, interrupt_status);
+    }
+#else
+    if (interrupt_status & 0x1u) {  /* Used buffer notification */
+        if (dev->tx_queue != NULL) {
+            dev->tx_last_used = virtio_net_read_tx_used_idx(dev);
+        }
+
+        /* Baseline: drain the RX used ring in the ISR before acknowledging. */
+        if (virtio_net_drain_rx_used(dev, dev_idx) > 0) {
+            if (dev->rx_sem != NULL) {
+                OSSemPost(dev->rx_sem);
+            }
+            if (g_rx_global_sem != NULL) {
+                OSSemPost(g_rx_global_sem);
+            }
+        }
+    }
     virtio_reg_write(dev, VIRTIO_MMIO_INTERRUPT_ACK, interrupt_status);
+#endif
 }
 
 /* Check if there are pending RX packets */
