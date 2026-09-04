@@ -408,8 +408,26 @@ static void send_icmp_echo_reply(struct net_interface *iface,
     util_memcpy(eth->src, original_src_mac, sizeof(original_src_mac));
 }
 
+static int net_demo_send_forward_frame(virtio_net_dev_t dev,
+                                       const uint8_t *frame,
+                                       size_t length,
+                                       const virtio_net_gso_info_t *gso)
+{
+    if (gso != NULL) {
+        return virtio_net_send_gso_frame_dev(dev, frame, length, gso);
+    }
+    return virtio_net_send_frame_dev(dev, frame, length);
+}
+
+static bool net_demo_forward_size_ok(size_t length, bool has_gso)
+{
+    return has_gso ? (length <= VIRTIO_NET_MAX_GSO_FRAME_SIZE) :
+                     (length <= VIRTIO_NET_MAX_FRAME_SIZE);
+}
+
 static int net_demo_process_frame(struct net_interface *iface,
-                                   uint8_t *frame, size_t length)
+                                   uint8_t *frame, size_t length,
+                                   uint16_t rx_desc_id)
 {
     if (length < sizeof(struct eth_header)) {
         return 0;
@@ -417,6 +435,16 @@ static int net_demo_process_frame(struct net_interface *iface,
 
     const struct eth_header *eth = (const struct eth_header *)frame;
     uint16_t eth_type = util_ntohs(eth->type);
+    virtio_net_gso_info_t rx_gso;
+    int rx_gso_status = virtio_net_get_rx_gso_info_dev(iface->dev,
+                                                       rx_desc_id,
+                                                       &rx_gso);
+    bool has_rx_gso = (rx_gso_status > 0);
+
+    if (rx_gso_status < 0 ||
+        (has_rx_gso && eth_type != 0x0800u)) {
+        return 0;
+    }
 
     if (eth_type == 0x0806u) {
         if (length < sizeof(struct eth_header) + sizeof(struct arp_packet)) {
@@ -462,6 +490,20 @@ static int net_demo_process_frame(struct net_interface *iface,
             return 0;
         }
 
+        if (has_rx_gso) {
+            uint16_t total_length = util_ntohs(ip->total_length);
+            size_t ip_header_len = (size_t)ihl * 4u;
+            if ((rx_gso.gso_type & (uint8_t)~VIRTIO_NET_HDR_GSO_ECN) !=
+                    VIRTIO_NET_HDR_GSO_TCPV4 || ip->protocol != 6u ||
+                total_length < ip_header_len + sizeof(struct tcp_header) ||
+                (size_t)total_length + sizeof(struct eth_header) > length ||
+                rx_gso.hdr_len < sizeof(struct eth_header) + ip_header_len +
+                                  sizeof(struct tcp_header) ||
+                rx_gso.hdr_len > length || rx_gso.gso_size == 0u) {
+                return 0;
+            }
+        }
+
         /* Fragment reassembly is not implemented by this forwarding path. */
         if ((util_ntohs(ip->flags_fragment) & 0x3FFFu) != 0u) {
             return 0;
@@ -488,7 +530,7 @@ static int net_demo_process_frame(struct net_interface *iface,
                     if (nat_translate_inbound(NAT_PROTO_ICMP, wan_port,
                                              ip->src, 0, lan_ip, &lan_port) == 0) {
                         /* Modify the packet in-place (frame is a private rx_buffer copy) */
-                        if (length <= VIRTIO_NET_MAX_FRAME_SIZE && g_lan_if.dev != NULL) {
+                        if (net_demo_forward_size_ok(length, has_rx_gso) && g_lan_if.dev != NULL) {
                             struct eth_header *fwd_eth = (struct eth_header *)frame;
                             struct ipv4_header *fwd_ip = (struct ipv4_header *)(frame + sizeof(*fwd_eth));
                             struct icmp_header *fwd_icmp = (struct icmp_header *)((uint8_t *)fwd_ip + ip_header_len);
@@ -515,8 +557,9 @@ static int net_demo_process_frame(struct net_interface *iface,
                             fwd_icmp->checksum = util_htons(checksum16(fwd_icmp, icmp_len));
 
                             /* Send on LAN interface */
-                            virtio_net_send_frame_dev(g_lan_if.dev, frame,
-                                                    sizeof(*fwd_eth) + total_length);
+                            net_demo_send_forward_frame(g_lan_if.dev, frame,
+                                                        sizeof(*fwd_eth) + total_length,
+                                                        NULL);
                             return 1;
                         }
                     }
@@ -557,7 +600,7 @@ static int net_demo_process_frame(struct net_interface *iface,
                 if (nat_translate_inbound(proto, wan_port,
                                          ip->src, src_port, lan_ip, &lan_port) == 0) {
                     /* Modify the packet in-place (frame is a private rx_buffer copy) */
-                    if (length <= VIRTIO_NET_MAX_FRAME_SIZE && g_lan_if.dev != NULL) {
+                    if (net_demo_forward_size_ok(length, has_rx_gso) && g_lan_if.dev != NULL) {
                         struct eth_header *fwd_eth = (struct eth_header *)frame;
                         struct ipv4_header *fwd_ip = (struct ipv4_header *)(frame + sizeof(*fwd_eth));
 
@@ -613,8 +656,10 @@ static int net_demo_process_frame(struct net_interface *iface,
                         }
 
                         /* Send on LAN interface */
-                        virtio_net_send_frame_dev(g_lan_if.dev, frame,
-                                                sizeof(*fwd_eth) + total_length);
+                        net_demo_send_forward_frame(g_lan_if.dev, frame,
+                                                    sizeof(*fwd_eth) + total_length,
+                                                    (has_rx_gso && ip->protocol == 6u) ?
+                                                        &rx_gso : NULL);
                         return 1;
                     }
                 }
@@ -667,7 +712,7 @@ static int net_demo_process_frame(struct net_interface *iface,
                             if (nat_translate_outbound(NAT_PROTO_ICMP, ip->src, icmp_id,
                                                       ip->dst, 0, &wan_port) == 0) {
                                 /* Modify the packet in-place (frame is a private rx_buffer copy) */
-                                if (length <= VIRTIO_NET_MAX_FRAME_SIZE) {
+                                if (net_demo_forward_size_ok(length, has_rx_gso)) {
                                     struct eth_header *fwd_eth = (struct eth_header *)frame;
                                     struct ipv4_header *fwd_ip = (struct ipv4_header *)(frame + sizeof(*fwd_eth));
                                     struct icmp_header *fwd_icmp = (struct icmp_header *)((uint8_t *)fwd_ip + ip_header_len);
@@ -694,8 +739,9 @@ static int net_demo_process_frame(struct net_interface *iface,
                                     fwd_icmp->checksum = util_htons(checksum16(fwd_icmp, icmp_len));
 
                                     /* Send on WAN interface */
-                                    virtio_net_send_frame_dev(g_wan_if.dev, frame,
-                                                            sizeof(*fwd_eth) + total_length);
+                                    net_demo_send_forward_frame(g_wan_if.dev, frame,
+                                                                sizeof(*fwd_eth) + total_length,
+                                                                NULL);
                                     return 1;
                                 }
                             }
@@ -725,7 +771,7 @@ static int net_demo_process_frame(struct net_interface *iface,
                         if (nat_translate_outbound(proto, ip->src, src_port,
                                                   ip->dst, dst_port, &wan_port) == 0) {
                             /* Modify the packet in-place (frame is a private rx_buffer copy) */
-                            if (length <= VIRTIO_NET_MAX_FRAME_SIZE) {
+                            if (net_demo_forward_size_ok(length, has_rx_gso)) {
                                 struct eth_header *fwd_eth = (struct eth_header *)frame;
                                 struct ipv4_header *fwd_ip = (struct ipv4_header *)(frame + sizeof(*fwd_eth));
 
@@ -781,8 +827,10 @@ static int net_demo_process_frame(struct net_interface *iface,
                                 }
 
                                 /* Send on WAN interface */
-                                virtio_net_send_frame_dev(g_wan_if.dev, frame,
-                                                        sizeof(*fwd_eth) + total_length);
+                                net_demo_send_forward_frame(g_wan_if.dev, frame,
+                                                            sizeof(*fwd_eth) + total_length,
+                                                            (has_rx_gso && ip->protocol == 6u) ?
+                                                                &rx_gso : NULL);
                                 return 1;
                             }
                         }
@@ -811,7 +859,7 @@ static int net_demo_process_frame(struct net_interface *iface,
                         if (nat_translate_inbound(NAT_PROTO_ICMP, wan_port,
                                                  ip->src, 0, lan_ip, &lan_port) == 0) {
                             /* Modify the packet in-place (frame is a private rx_buffer copy) */
-                            if (length <= VIRTIO_NET_MAX_FRAME_SIZE && g_lan_if.dev != NULL) {
+                            if (net_demo_forward_size_ok(length, has_rx_gso) && g_lan_if.dev != NULL) {
                                 struct eth_header *fwd_eth = (struct eth_header *)frame;
                                 struct ipv4_header *fwd_ip = (struct ipv4_header *)(frame + sizeof(*fwd_eth));
                                 struct icmp_header *fwd_icmp = (struct icmp_header *)((uint8_t *)fwd_ip + ip_header_len);
@@ -839,8 +887,9 @@ static int net_demo_process_frame(struct net_interface *iface,
                                 fwd_icmp->checksum = util_htons(checksum16(fwd_icmp, icmp_len));
 
                                 /* Send on LAN interface */
-                                virtio_net_send_frame_dev(g_lan_if.dev, frame,
-                                                        sizeof(*fwd_eth) + total_length);
+                                net_demo_send_forward_frame(g_lan_if.dev, frame,
+                                                            sizeof(*fwd_eth) + total_length,
+                                                            NULL);
                                 return 1;
                             }
                         }
@@ -869,7 +918,7 @@ static int net_demo_process_frame(struct net_interface *iface,
                         if (nat_translate_inbound(proto, wan_port,
                                                  ip->src, src_port, lan_ip, &lan_port) == 0) {
                             /* Modify the packet in-place (frame is a private rx_buffer copy) */
-                            if (length <= VIRTIO_NET_MAX_FRAME_SIZE && g_lan_if.dev != NULL) {
+                        if (net_demo_forward_size_ok(length, has_rx_gso) && g_lan_if.dev != NULL) {
                                 struct eth_header *fwd_eth = (struct eth_header *)frame;
                                 struct ipv4_header *fwd_ip = (struct ipv4_header *)(frame + sizeof(*fwd_eth));
 
@@ -924,8 +973,10 @@ static int net_demo_process_frame(struct net_interface *iface,
                                 }
 
                                 /* Send on LAN interface */
-                                virtio_net_send_frame_dev(g_lan_if.dev, frame,
-                                                        sizeof(*fwd_eth) + total_length);
+                                net_demo_send_forward_frame(g_lan_if.dev, frame,
+                                                            sizeof(*fwd_eth) + total_length,
+                                                            (has_rx_gso && ip->protocol == 6u) ?
+                                                                &rx_gso : NULL);
                                 return 1;
                             }
                         }
@@ -1007,7 +1058,7 @@ static void net_rx_task(void *p_arg)
             size_t len = 0u;
             uint8_t *frame = virtio_net_peek_rx_buffer_dev(iface->dev, &len, &desc_id);
             if (frame != NULL && len > 0u) {
-                net_demo_process_frame(iface, frame, len);
+                net_demo_process_frame(iface, frame, len, desc_id);
                 virtio_net_release_rx_buffer_dev(iface->dev, desc_id);
             } else {
                 break;

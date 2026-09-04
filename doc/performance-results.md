@@ -26,6 +26,8 @@
 | TX TCP/UDP checksum offload step 1 | 902.2 → 910.7 Mbps | 約 **+0.9%** | 1027.0 → 1068.5 Mbps | 約 **+4.0%** | corrected BPI A/B 三次各方向均成功；只協商 `VIRTIO_NET_F_CSUM`，採用 |
 | VirtIO used-event IRQ suppression step 2 | 920.3 → 941.4 Mbps | 約 **+2.3%** | 1032.0 → 1106.7 Mbps | 約 **+7.2%** | 只使用 `used_event` 抑制裝置 IRQ；BPI A/B 12 次全數完成，採用 |
 | RX checksum offload step 3 | 904.9 → 940.0 Mbps | 約 **+3.9%** | 1036.6 → 1074.7 Mbps | 約 **+3.7%** | 協商 `VIRTIO_NET_F_GUEST_CSUM` 並驗證 RX metadata；BPI A/B 12 次全數完成，採用 |
+| Mergeable RX buffers step 4A | 910.3 → 879.6 Mbps | **-3.4%** | 985.9 → 980.6 Mbps | **-0.5%** | 單 buffer fast path 已保留；本身沒有 throughput 收益，但作為 GSO RX 的必要 prerequisite |
+| TCPv4 GSO pass-through step 5 | 826.6 → 1026.7 Mbps | **+24.2%** | 807.4 → 1294.6 Mbps | **+60.4%** | **採用；BPI vhost 3×3 A/B，12 次 iperf3 全通過，enabled case 0 retransmit** |
 | Packed virtqueue candidate | 243.0 → 248.5 Mbps* | 約 +2.2%* | 242.1 → 211.1 Mbps* | 約 **-12.8%*** | 不採用；BPI `vhost=on` 不提供 packed feature，`vhost=off` 的單次對照 RX 反而下降 |
 | RX IRQ minimal + task poll | full ISR 不可持續 → 835 Mbps | N/A† | full ISR 未完成 → 975 Mbps | N/A† | **採用候選；將 RX used-ring drain 移到 task，避免單 vCPU 被 IRQ drain 佔滿** |
 | RX used-ring incremental invalidate | 850.0 → 852.0 Mbps | 約 +0.2% | 1003.5 → 988.7 Mbps | 約 -1.5% | 正確性與 cache 工作量改善，但 throughput 未見可辨識增益，暫不宣稱效能提升 |
@@ -130,6 +132,30 @@ RX path 原本沒有做軟體 transport-checksum validation，因此這項不是
 
 相對改善為 TX 約 **+3.9%**、reverse-RX 約 **+3.7%**。12 次 iperf3 全部正常完成，所有 LAN/WAN gateway ping 均為 0% packet loss；6 個 enabled guest boot log 均顯示兩張 NIC 成功協商 RX checksum offload，未出現 unsupported RX metadata。測試只建立並清除 `u14q`/`u14c`/`u14s` namespace、bridge、TAP 與 veth，未修改既有 BPI network 或 DrayOS QEMU。
 
+### Mergeable RX buffers step 4A 的 BPI A/B 數據
+
+這一項固定使用既有 task-poll、TX batch 32、TX/RX checksum offload、used-event suppression，以及 BPI-R4 KVM/vhost；只比較 `VIRTIO_NET_MRG_RXBUF=0/1`，GSO 保持關閉。driver 保留 2 KiB RX buffers，在 `num_buffers=1` 的一般封包走 fast path，只有真正跨 buffer 的封包才組合到 64 KiB merge storage。
+
+| 狀態 | TX runs | TX mean | reverse-RX runs | reverse-RX mean |
+|---|---|---:|---|---:|
+| `VIRTIO_NET_MRG_RXBUF=0` | 914.0, 903.9, 913.1 Mbps | 910.3 Mbps | 978.1, 991.6, 988.0 Mbps | 985.9 Mbps |
+| `VIRTIO_NET_MRG_RXBUF=1` | 890.0, 890.4, 858.4 Mbps | 879.6 Mbps | 977.6, 974.8, 989.4 Mbps | 980.6 Mbps |
+
+相對為 TX **-3.4%**、reverse-RX **-0.5%**，因此不把 MRG_RXBUF 當成獨立 throughput 優化提交；它是後續接收 GSO superpacket 所需的相容性基礎。單 buffer fast path 已保留，避免一般 MTU 流量承擔 merged completion 的大筆複製成本。
+
+### TCPv4 GSO pass-through step 5 的 BPI A/B 數據
+
+這組正式比較固定使用 BPI-R4、KVM、1 vCPU、512 MiB、兩張 VirtIO-net、QEMU `vhost=on`，以及 `csum=on,guest_csum=on,gso=on,guest_tso4=on,host_tso4=on,mrg_rxbuf=on,event_idx=on,tx_queue_size=256,rx_queue_size=256`。只切換 compile-time `VIRTIO_NET_GSO_OFFLOAD=0/1`；兩個 case 都保留 MRG_RXBUF。每個 case 每方向 3 次、每次 10 秒，測試 guest 都重新啟動。
+
+| 狀態 | TX runs（LAN → WAN） | TX mean | reverse-RX runs（WAN → LAN） | reverse-RX mean |
+|---|---|---:|---|---:|
+| `VIRTIO_NET_GSO_OFFLOAD=0` | 870.6, 796.5, 812.8 Mbps | 826.6 Mbps | 814.0, 808.7, 799.7 Mbps | 807.4 Mbps |
+| `VIRTIO_NET_GSO_OFFLOAD=1` | 1024.5, 1021.0, 1034.7 Mbps | 1026.7 Mbps | 1274.4, 1308.3, 1301.1 Mbps | 1294.6 Mbps |
+
+改善率為 TX **+24.2%**、reverse-RX **+60.4%**。這組 3×3 A/B 的 12 次 iperf3 全部 return 0，12 次 LAN/WAN ping 均為 0% packet loss；enabled case 的 TX chain unavailable、TX used-ring overrun、unsupported RX metadata 均為 0，iperf3 retransmit 為 0。disabled baseline 的 retransmit 為 TX 167/129/110、reverse-RX 52/119/41，仍可完成測試但 throughput 較低。修正後另以 enabled image 進行 60 秒長測：TX 1014.5 Mbps、reverse-RX 1303.5 Mbps，兩者均 0 retransmit、0 driver error。
+
+實作上，RX 端接受並組合 IPv4 TCP GSO superpacket，NAT 更新 IP/port 後由 TX 端以 descriptor chain 傳回 host；TX reclaim、allocator 與 avail-ring publish 均以 critical section 保護 task/IRQ 競爭，descriptor 不足時先 notify host 並等待回收。`VIRTIO_NET_GSO_OFFLOAD` 已設為 default 1；若 host 沒有對應 TSO capability，driver 不會協商該 feature，仍走一般 frame path。測試使用 `uc41-*`、`ucsi-step5-*` temporary network resources，完成後清除，未修改既有 BPI network 或 DrayOS QEMU PID 779158。
+
 ### Packed virtqueue candidate 的 BPI 對照
 
 這是相容性/效能候選，不是已採用的 offload。driver 新增 `VIRTIO_F_RING_PACKED` 的 opt-in，沒有 packed feature 時會 fallback 到既有 split ring。BPI 正式 `vhost=on` 的 host feature bitmap 為 `0x1c00101`，不包含 packed bit，因此實際仍使用 split ring，沒有可宣稱的 vhost throughput 改善。
@@ -156,11 +182,11 @@ RX path 原本沒有做軟體 transport-checksum validation，因此這項不是
 
 目前 dual-device build 的 ELF section 結果約為：
 
-- `.bss`：2,190,864 bytes，約 2.09 MiB
+- `.bss`：2,519,600 bytes，約 2.40 MiB（GSO/MRG RX completion storage 已包含）
 - guest RAM：512 MiB
 - build：`make clean && make` PASS
 - timer/context test：`make test-timer` PASS
 
 ## Current decision
 
-目前保留並已 push 的主要效能修正是 used-ring alignment、cache ordering 調整、checksum path、used-index-only polling、RX IRQ minimal + task poll、RX used-ring incremental invalidate（commit `121ab18`），RX recycle/avail-ring batching（commit `c0817e7`），以及 TX notify batch size 32（commit `ad272e6`）。TX checksum offload step 1 已完成 corrected BPI A/B、TCP/UDP raw checksum 驗證與 agy review PASS，確認 reverse-RX 約 4.0% 改善、TX 約 0.9% 改善。step 2 的 used-event-only IRQ suppression 已完成 BPI A/B 與 agy review PASS，並已 commit/push（commit `8c639f2`）：TX 約 +2.3%、reverse-RX 約 +7.2%。step 3 RX checksum offload 已完成 final source BPI A/B、agy review PASS，並已 commit/push（commit `77bc1f0`）：TX 約 +3.9%、reverse-RX 約 +3.7%。zero-copy forwarding 只完成候選實驗，因為在 BPI 實測明顯降低 throughput，已撤回，不會進入正式版本。
+目前保留並已 push 的主要效能修正是 used-ring alignment、cache ordering 調整、checksum path、used-index-only polling、RX IRQ minimal + task poll、RX used-ring incremental invalidate（commit `121ab18`），RX recycle/avail-ring batching（commit `c0817e7`），以及 TX notify batch size 32（commit `ad272e6`）。TX checksum offload step 1 已完成 corrected BPI A/B、TCP/UDP raw checksum 驗證與 agy review PASS，確認 reverse-RX 約 4.0% 改善、TX 約 0.9% 改善。step 2 的 used-event-only IRQ suppression 已完成 BPI A/B 與 agy review PASS，並已 commit/push（commit `8c639f2`）：TX 約 +2.3%、reverse-RX 約 +7.2%。step 3 RX checksum offload 已完成 final source BPI A/B、agy review PASS，並已 commit/push（commit `77bc1f0`）：TX 約 +3.9%、reverse-RX 約 +3.7%。step 4A MRG_RXBUF 本身沒有 throughput 收益，但已成為 GSO prerequisite；step 5 TCPv4 GSO pass-through 已完成修正版 BPI 3×3 A/B、60 秒雙向 stability test、fallback build 與 agy review PASS，TX 約 +24.2%、reverse-RX 約 +60.4%，source default 已開啟 `VIRTIO_NET_GSO_OFFLOAD=1`。zero-copy forwarding 只完成候選實驗，因為在 BPI 實測明顯降低 throughput，已撤回，不會進入正式版本。

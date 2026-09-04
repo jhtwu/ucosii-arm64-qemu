@@ -12,6 +12,9 @@
 #define VIRTIO_NET_DEFAULT_IRQ         48u
 
 #define VIRTIO_NET_MAX_FRAME_SIZE      1518u
+#define VIRTIO_NET_MAX_GSO_FRAME_SIZE  65549u
+#define VIRTIO_NET_HDR_GSO_TCPV4       1u
+#define VIRTIO_NET_HDR_GSO_ECN         0x80u
 
 /* 1: IRQ only signals and the RX task polls the used ring; 0: ISR drains it. */
 #ifndef VIRTIO_NET_RX_DEFER_POLL
@@ -36,6 +39,16 @@
 #define VIRTIO_NET_RX_CSUM_OFFLOAD        1u
 #endif
 
+/* 1: negotiate mergeable RX buffers and coalesce a packet spanning buffers. */
+#ifndef VIRTIO_NET_MRG_RXBUF
+#define VIRTIO_NET_MRG_RXBUF              1u
+#endif
+
+/* 1: negotiate and pass through IPv4 TCP GSO packets when supported. */
+#ifndef VIRTIO_NET_GSO_OFFLOAD
+#define VIRTIO_NET_GSO_OFFLOAD            1u
+#endif
+
 /* 1: use split-ring used-event fields to suppress device IRQs. */
 #ifndef VIRTIO_NET_EVENT_IDX
 #define VIRTIO_NET_EVENT_IDX              1u
@@ -46,6 +59,15 @@
 
 /* Device handle type */
 typedef struct virtio_net_device* virtio_net_dev_t;
+
+/* RX/TX metadata for the currently supported IPv4 TCP GSO path. */
+typedef struct virtio_net_gso_info {
+    uint8_t gso_type;
+    uint16_t hdr_len;
+    uint16_t gso_size;
+    uint16_t csum_start;
+    uint16_t csum_offset;
+} virtio_net_gso_info_t;
 
 /* Initialize and discover all VirtIO network devices */
 int virtio_net_init_all(void);
@@ -61,10 +83,17 @@ size_t virtio_net_get_device_count(void);
 
 /* Device-specific operations */
 int virtio_net_send_frame_dev(virtio_net_dev_t dev, const uint8_t *frame, size_t length);
+int virtio_net_send_gso_frame_dev(virtio_net_dev_t dev,
+                                  const uint8_t *frame,
+                                  size_t length,
+                                  const virtio_net_gso_info_t *gso);
 int virtio_net_tx_csum_offload_enabled_dev(virtio_net_dev_t dev);
 int virtio_net_poll_rx_dev(virtio_net_dev_t dev);
 int virtio_net_poll_frame_dev(virtio_net_dev_t dev, uint8_t *out_frame, size_t *out_length);
 const uint8_t *virtio_net_get_mac_dev(virtio_net_dev_t dev);
+int virtio_net_get_rx_gso_info_dev(virtio_net_dev_t dev,
+                                   uint16_t desc_id,
+                                   virtio_net_gso_info_t *gso);
 void virtio_net_enable_interrupts_dev(virtio_net_dev_t dev);
 int virtio_net_has_pending_rx_dev(virtio_net_dev_t dev);
 INT8U virtio_net_wait_rx_dev(virtio_net_dev_t dev, uint16_t timeout_ms);

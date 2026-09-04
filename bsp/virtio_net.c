@@ -8,6 +8,7 @@
 #include "cache.h"
 
 #include <ucos_ii.h>
+#include <stdbool.h>
 
 #define VIRTIO_MMIO_MAGIC_VALUE         0x000u
 #define VIRTIO_MMIO_VERSION             0x004u
@@ -45,6 +46,10 @@
 #define VIRTIO_NET_F_CSUM               0u
 #define VIRTIO_NET_F_GUEST_CSUM         1u
 #define VIRTIO_NET_F_MAC                5u
+#define VIRTIO_NET_F_GSO                6u
+#define VIRTIO_NET_F_GUEST_TSO4         7u
+#define VIRTIO_NET_F_HOST_TSO4          11u
+#define VIRTIO_NET_F_MRG_RXBUF          15u
 #define VIRTIO_RING_F_EVENT_IDX         29u
 #define VIRTIO_F_VERSION_1              32u
 
@@ -61,8 +66,13 @@
 
 #define VIRTIO_NET_QUEUE_SIZE           256u
 #define VIRTIO_NET_BUFFER_SIZE          2048u
+#define VIRTIO_NET_RX_MAX_MRG_BUFFERS   64u
+#define VIRTIO_NET_MAX_RX_FRAME_SIZE    65549u /* Ethernet header + max IPv4 packet */
 #ifndef VIRTIO_NET_TX_BATCH_SIZE
 #define VIRTIO_NET_TX_BATCH_SIZE        32u   /* notify host every N queued TX frames */
+#endif
+#ifndef VIRTIO_NET_TX_CHAIN_WAIT_RETRIES
+#define VIRTIO_NET_TX_CHAIN_WAIT_RETRIES 1000u /* allow vhost time to reclaim chains */
 #endif
 #define VIRTIO_NET_USED_RING_STRIDE     4096u /* keep each used ring 4-byte aligned */
 
@@ -125,6 +135,9 @@ struct virtio_net_device {
     uint8_t driver_ok;
     uint8_t tx_csum_offload;
     uint8_t rx_csum_offload;
+    uint8_t rx_mrg_rxbuf;
+    uint8_t tx_gso_offload;
+    uint8_t rx_gso_offload;
     uint8_t event_idx;
     struct virtio_queue *rx_queue;
     struct virtio_queue *tx_queue;
@@ -132,6 +145,10 @@ struct virtio_net_device {
     uint8_t *tx_buffers[VIRTIO_NET_QUEUE_SIZE];
     OS_EVENT *rx_sem;
     uint16_t tx_batch_count;   /* frames queued but host not yet notified */
+    uint16_t tx_alloc_cursor;
+    uint16_t tx_inflight_desc;
+    uint8_t tx_desc_in_use[VIRTIO_NET_QUEUE_SIZE];
+    uint8_t tx_chain_len[VIRTIO_NET_QUEUE_SIZE];
     uint16_t rx_recycle_start;  /* first avail slot in pending recycle batch */
     uint16_t rx_recycle_count;  /* RX avail entries awaiting cache/notify */
 };
@@ -171,10 +188,17 @@ static INT32U virtio_ms_to_ticks(INT16U timeout_ms)
 
 static uint8_t g_rx_buffer_storage[VIRTIO_NET_MAX_DEVICES][VIRTIO_NET_QUEUE_SIZE][VIRTIO_NET_BUFFER_SIZE] __attribute__((aligned(64)));
 static uint8_t g_tx_buffer_storage[VIRTIO_NET_MAX_DEVICES][VIRTIO_NET_QUEUE_SIZE][VIRTIO_NET_BUFFER_SIZE] __attribute__((aligned(64)));
+/* MRG_RXBUF keeps the existing 2 KiB descriptor buffers and coalesces only
+ * when a device actually returns more than one buffer for a packet. */
+static uint8_t g_rx_merge_storage[VIRTIO_NET_MAX_DEVICES][VIRTIO_NET_MAX_RX_FRAME_SIZE]
+    __attribute__((aligned(64)));
 
 struct rx_completion_entry {
     uint16_t desc_id;
+    uint16_t num_buffers;
     uint32_t total_len;
+    uint16_t buffer_ids[VIRTIO_NET_RX_MAX_MRG_BUFFERS];
+    uint16_t buffer_lens[VIRTIO_NET_RX_MAX_MRG_BUFFERS];
 };
 
 static struct rx_completion_entry g_rx_completions[VIRTIO_NET_MAX_DEVICES][VIRTIO_NET_QUEUE_SIZE];
@@ -439,6 +463,10 @@ static void virtio_net_prepare_tx(struct virtio_net_device *dev, size_t dev_idx)
     }
     avail->idx = 0u;
     dev->tx_last_used = 0u;
+    dev->tx_alloc_cursor = 0u;
+    dev->tx_inflight_desc = 0u;
+    util_memset(dev->tx_desc_in_use, 0, sizeof(dev->tx_desc_in_use));
+    util_memset(dev->tx_chain_len, 0, sizeof(dev->tx_chain_len));
 
     cache_clean_range(desc, sizeof(struct vring_desc) * dev->tx_queue_size);
     cache_clean_range(avail, sizeof(*avail));
@@ -539,6 +567,33 @@ static void virtio_net_recycle_rx_desc(struct virtio_net_device *dev,
     }
 }
 
+static void virtio_net_recycle_rx_completion(struct virtio_net_device *dev,
+                                             const struct rx_completion_entry *completion)
+{
+    if (dev == NULL || completion == NULL || completion->num_buffers == 0u ||
+        completion->num_buffers > VIRTIO_NET_RX_MAX_MRG_BUFFERS) {
+        return;
+    }
+
+    for (uint16_t i = 0u; i < completion->num_buffers; ++i) {
+        uint16_t desc_id = completion->buffer_ids[i];
+        bool duplicate = false;
+
+        if (desc_id >= dev->rx_queue_size) {
+            continue;
+        }
+        for (uint16_t j = 0u; j < i; ++j) {
+            if (completion->buffer_ids[j] == desc_id) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) {
+            virtio_net_recycle_rx_desc(dev, desc_id);
+        }
+    }
+}
+
 static void virtio_net_invalidate_rx_used_entries(struct virtio_net_device *dev,
                                                   uint16_t first_used,
                                                   uint16_t pending)
@@ -558,6 +613,41 @@ static void virtio_net_invalidate_rx_used_entries(struct virtio_net_device *dev,
                                (size_t)chunk * sizeof(struct vring_used_elem));
         cursor = (uint16_t)(cursor + chunk);
         pending = (uint16_t)(pending - chunk);
+    }
+}
+
+static void virtio_net_recycle_rx_used_span(struct virtio_net_device *dev,
+                                            struct vring_used *used,
+                                            uint16_t first_used,
+                                            uint16_t count)
+{
+    uint16_t desc_ids[VIRTIO_NET_QUEUE_SIZE];
+
+    if (dev == NULL || used == NULL || count == 0u || count > dev->rx_queue_size ||
+        count > VIRTIO_NET_QUEUE_SIZE) {
+        return;
+    }
+
+    for (uint16_t i = 0u; i < count; ++i) {
+        uint16_t used_index = (uint16_t)((first_used + i) % dev->rx_queue_size);
+        desc_ids[i] = (uint16_t)used->ring[used_index].id;
+    }
+    for (uint16_t i = 0u; i < count; ++i) {
+        uint16_t desc_id = desc_ids[i];
+        bool duplicate = false;
+
+        if (desc_id >= dev->rx_queue_size) {
+            continue;
+        }
+        for (uint16_t j = 0u; j < i; ++j) {
+            if (desc_ids[j] == desc_id) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) {
+            virtio_net_recycle_rx_desc(dev, desc_id);
+        }
     }
 }
 
@@ -592,35 +682,141 @@ static int virtio_net_drain_rx_used(struct virtio_net_device *dev, size_t dev_id
     /* Invalidate only entries published since the previous drain. */
     virtio_net_invalidate_rx_used_entries(dev, dev->rx_last_used, pending);
 
-    while (1) {
-        if (dev->rx_last_used == used_idx) {
-            break;
-        }
+    while (dev->rx_last_used != used_idx) {
         uint16_t used_index = (uint16_t)(dev->rx_last_used % queue_size);
         struct vring_used_elem *elem = &used->ring[used_index];
-        uint16_t desc_id = (uint16_t)elem->id;
+        uint16_t first_desc_id = (uint16_t)elem->id;
+        uint16_t num_buffers = 1u;
+        uint16_t first_len = (uint16_t)elem->len;
 
-        if (desc_id >= queue_size) {
+        if (first_desc_id >= queue_size || first_len < sizeof(struct virtio_net_hdr) ||
+            first_len > VIRTIO_NET_BUFFER_SIZE) {
             uart_puts("[virtio-net] RX descriptor index out of range\n");
             dev->rx_last_used++;
+            pending--;
+            continue;
+        }
+
+        /* The first buffer contains the virtio-net header.  With MRG_RXBUF
+         * negotiated, num_buffers describes this used-ring span. */
+        cache_invalidate_range(dev->rx_buffers[first_desc_id], first_len);
+        if (dev->rx_mrg_rxbuf != 0u) {
+            struct virtio_net_hdr *hdr =
+                (struct virtio_net_hdr *)dev->rx_buffers[first_desc_id];
+            num_buffers = hdr->num_buffers;
+            if (num_buffers == 0u) {
+                uart_puts("[virtio-net] RX merge header has zero buffers\n");
+                num_buffers = 1u;
+            }
+        }
+
+        if (num_buffers > queue_size || num_buffers > pending) {
+            if (num_buffers > queue_size) {
+                uart_puts("[virtio-net] RX merge buffer count is invalid\n");
+                virtio_net_recycle_rx_desc(dev, first_desc_id);
+                dev->rx_last_used++;
+                pending--;
+                continue;
+            }
+            /* A compliant device publishes all used entries belonging to a
+             * merged packet before advancing used->idx.  Keep the head
+             * pending if the span is not visible yet. */
+            break;
+        }
+
+        if (num_buffers > VIRTIO_NET_RX_MAX_MRG_BUFFERS) {
+            uart_puts("[virtio-net] RX merged packet exceeds driver limit\n");
+            virtio_net_recycle_rx_used_span(dev, used, dev->rx_last_used, num_buffers);
+            dev->rx_last_used = (uint16_t)(dev->rx_last_used + num_buffers);
+            pending = (uint16_t)(pending - num_buffers);
+            continue;
+        }
+
+        /* Keep the normal MTU-sized path free of merged-completion copies.
+         * MRG_RXBUF is negotiated for large packets, but almost all router
+         * traffic still completes in one buffer. */
+        if (num_buffers == 1u) {
+            if (g_rx_completion_count[dev_idx] >= queue_size) {
+                uart_puts("[virtio-net] RX completion queue full\n");
+                virtio_net_recycle_rx_desc(dev, first_desc_id);
+                dev->rx_last_used++;
+                pending--;
+                continue;
+            }
+
+            struct rx_completion_entry *completion =
+                &g_rx_completions[dev_idx][g_rx_completion_tail[dev_idx]];
+            completion->desc_id = first_desc_id;
+            completion->num_buffers = 1u;
+            completion->total_len = first_len;
+            completion->buffer_ids[0] = first_desc_id;
+            completion->buffer_lens[0] = first_len;
+            g_rx_completion_tail[dev_idx] =
+                (uint16_t)((g_rx_completion_tail[dev_idx] + 1u) % queue_size);
+            g_rx_completion_count[dev_idx]++;
+            enqueued++;
+            dev->rx_last_used++;
+            pending--;
+            continue;
+        }
+
+        struct rx_completion_entry candidate;
+        bool valid = true;
+        util_memset(&candidate, 0, sizeof(candidate));
+        candidate.desc_id = first_desc_id;
+        candidate.num_buffers = num_buffers;
+        for (uint16_t i = 0u; i < num_buffers; ++i) {
+            uint16_t span_index = (uint16_t)((dev->rx_last_used + i) % queue_size);
+            struct vring_used_elem *span_elem = &used->ring[span_index];
+            uint16_t desc_id = (uint16_t)span_elem->id;
+            uint32_t buffer_len = span_elem->len;
+
+            candidate.buffer_ids[i] = desc_id;
+            candidate.buffer_lens[i] = (uint16_t)buffer_len;
+            if (desc_id >= queue_size || buffer_len == 0u ||
+                buffer_len > VIRTIO_NET_BUFFER_SIZE) {
+                valid = false;
+                continue;
+            }
+            for (uint16_t j = 0u; j < i; ++j) {
+                if (candidate.buffer_ids[j] == desc_id) {
+                    valid = false;
+                }
+            }
+            candidate.total_len += buffer_len;
+            cache_invalidate_range(dev->rx_buffers[desc_id], buffer_len);
+        }
+
+        if (candidate.buffer_lens[0] < sizeof(struct virtio_net_hdr) ||
+            candidate.total_len <= sizeof(struct virtio_net_hdr)) {
+            valid = false;
+        }
+
+        if (!valid) {
+            uart_puts("[virtio-net] Invalid merged RX buffer span\n");
+            virtio_net_recycle_rx_completion(dev, &candidate);
+            dev->rx_last_used = (uint16_t)(dev->rx_last_used + num_buffers);
+            pending = (uint16_t)(pending - num_buffers);
             continue;
         }
 
         if (g_rx_completion_count[dev_idx] >= queue_size) {
             uart_puts("[virtio-net] RX completion queue full\n");
-            virtio_net_recycle_rx_desc(dev, desc_id);
-            virtio_net_flush_rx_recycle(dev);
-            dev->rx_last_used++;
+            virtio_net_recycle_rx_completion(dev, &candidate);
+            dev->rx_last_used = (uint16_t)(dev->rx_last_used + num_buffers);
+            pending = (uint16_t)(pending - num_buffers);
             continue;
         }
 
-        g_rx_completions[dev_idx][g_rx_completion_tail[dev_idx]].desc_id = desc_id;
-        g_rx_completions[dev_idx][g_rx_completion_tail[dev_idx]].total_len = elem->len;
-        g_rx_completion_tail[dev_idx] = (uint16_t)((g_rx_completion_tail[dev_idx] + 1u) % queue_size);
+        util_memcpy(&g_rx_completions[dev_idx][g_rx_completion_tail[dev_idx]],
+                    &candidate, sizeof(candidate));
+        g_rx_completion_tail[dev_idx] =
+            (uint16_t)((g_rx_completion_tail[dev_idx] + 1u) % queue_size);
         g_rx_completion_count[dev_idx]++;
         enqueued++;
 
-        dev->rx_last_used++;
+        dev->rx_last_used = (uint16_t)(dev->rx_last_used + num_buffers);
+        pending = (uint16_t)(pending - num_buffers);
     }
 
     virtio_net_arm_rx_used_event(dev, used_idx);
@@ -723,6 +919,352 @@ static uint16_t virtio_net_read_tx_used_idx(struct virtio_net_device *dev)
     return used_idx;
 }
 
+static void virtio_net_invalidate_tx_used_entries(struct virtio_net_device *dev,
+                                                  uint16_t first_used,
+                                                  uint16_t pending)
+{
+    struct vring_used *used = dev->tx_queue->used;
+    uint16_t queue_size = dev->tx_queue_size;
+    uint16_t cursor = first_used;
+
+    while (pending != 0u) {
+        uint16_t ring_index = (uint16_t)(cursor % queue_size);
+        uint16_t chunk = (uint16_t)(queue_size - ring_index);
+        if (chunk > pending) {
+            chunk = pending;
+        }
+
+        cache_invalidate_range(&used->ring[ring_index],
+                               (size_t)chunk * sizeof(struct vring_used_elem));
+        cursor = (uint16_t)(cursor + chunk);
+        pending = (uint16_t)(pending - chunk);
+    }
+}
+
+static void virtio_net_release_tx_chain(struct virtio_net_device *dev,
+                                        uint16_t head,
+                                        uint16_t count)
+{
+    if (dev == NULL || count == 0u || count > dev->tx_queue_size ||
+        head >= dev->tx_queue_size) {
+        return;
+    }
+
+    OS_CPU_SR cpu_sr;
+    OS_ENTER_CRITICAL();
+    for (uint16_t i = 0u; i < count; ++i) {
+        uint16_t desc_id = (uint16_t)((head + i) % dev->tx_queue_size);
+        dev->tx_desc_in_use[desc_id] = 0u;
+        dev->tx_chain_len[desc_id] = 0u;
+    }
+    if (dev->tx_inflight_desc >= count) {
+        dev->tx_inflight_desc = (uint16_t)(dev->tx_inflight_desc - count);
+    } else {
+        dev->tx_inflight_desc = 0u;
+    }
+    OS_EXIT_CRITICAL();
+}
+
+static void virtio_net_reclaim_tx_used(struct virtio_net_device *dev)
+{
+    struct vring_used *used;
+    uint16_t used_idx;
+    uint16_t pending;
+
+    if (dev == NULL || dev->tx_queue == NULL || dev->tx_queue_size == 0u) {
+        return;
+    }
+
+    /* TX reclaim is reachable from both task context and the VirtIO ISR.
+     * Protect the used-index and descriptor ownership update as one critical
+     * section so an IRQ cannot observe or modify half-updated state. */
+    OS_CPU_SR cpu_sr;
+    OS_ENTER_CRITICAL();
+
+    used = dev->tx_queue->used;
+    used_idx = virtio_net_read_tx_used_idx(dev);
+    pending = (uint16_t)(used_idx - dev->tx_last_used);
+    if (pending == 0u) {
+        OS_EXIT_CRITICAL();
+        return;
+    }
+    if (pending > dev->tx_queue_size) {
+        uart_puts("[virtio-net] TX used ring overrun\n");
+        dev->tx_last_used = used_idx;
+        dev->tx_inflight_desc = 0u;
+        util_memset(dev->tx_desc_in_use, 0, sizeof(dev->tx_desc_in_use));
+        util_memset(dev->tx_chain_len, 0, sizeof(dev->tx_chain_len));
+        OS_EXIT_CRITICAL();
+        return;
+    }
+
+    virtio_net_invalidate_tx_used_entries(dev, dev->tx_last_used, pending);
+    while (dev->tx_last_used != used_idx) {
+        uint16_t used_index = (uint16_t)(dev->tx_last_used % dev->tx_queue_size);
+        uint16_t head = (uint16_t)used->ring[used_index].id;
+        uint16_t chain_len = 0u;
+
+        if (head < dev->tx_queue_size) {
+            chain_len = dev->tx_chain_len[head];
+            if (chain_len == 0u) {
+                /* A malformed completion must not permanently consume a
+                 * descriptor.  Normal/GSO submissions always record a chain
+                 * length before publishing the avail entry. */
+                chain_len = 1u;
+            }
+            virtio_net_release_tx_chain(dev, head, chain_len);
+        } else {
+            uart_puts("[virtio-net] TX completion descriptor out of range\n");
+        }
+        dev->tx_last_used++;
+    }
+    OS_EXIT_CRITICAL();
+}
+
+static void virtio_net_notify_pending_tx(struct virtio_net_device *dev)
+{
+    if (dev == NULL) {
+        return;
+    }
+
+    OS_CPU_SR cpu_sr;
+    OS_ENTER_CRITICAL();
+    if (dev->tx_batch_count > 0u) {
+        cache_sync();
+        virtio_reg_write(dev, VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_TX_QUEUE);
+        dev->tx_batch_count = 0u;
+    }
+    OS_EXIT_CRITICAL();
+}
+
+static int virtio_net_alloc_tx_chain(struct virtio_net_device *dev,
+                                     uint16_t count,
+                                     uint16_t *head_out)
+{
+    if (dev == NULL || head_out == NULL || count == 0u ||
+        count > dev->tx_queue_size ||
+        (uint32_t)dev->tx_inflight_desc + count > dev->tx_queue_size) {
+        return -1;
+    }
+
+    OS_CPU_SR cpu_sr;
+    OS_ENTER_CRITICAL();
+    for (uint16_t offset = 0u; offset < dev->tx_queue_size; ++offset) {
+        uint16_t head = (uint16_t)((dev->tx_alloc_cursor + offset) % dev->tx_queue_size);
+        bool free_chain = true;
+        for (uint16_t i = 0u; i < count; ++i) {
+            uint16_t desc_id = (uint16_t)((head + i) % dev->tx_queue_size);
+            if (dev->tx_desc_in_use[desc_id] != 0u) {
+                free_chain = false;
+                break;
+            }
+        }
+        if (!free_chain) {
+            continue;
+        }
+
+        for (uint16_t i = 0u; i < count; ++i) {
+            uint16_t desc_id = (uint16_t)((head + i) % dev->tx_queue_size);
+            dev->tx_desc_in_use[desc_id] = 1u;
+        }
+        dev->tx_chain_len[head] = (uint8_t)count;
+        dev->tx_inflight_desc = (uint16_t)(dev->tx_inflight_desc + count);
+        dev->tx_alloc_cursor = (uint16_t)((head + count) % dev->tx_queue_size);
+        *head_out = head;
+        OS_EXIT_CRITICAL();
+        return 0;
+    }
+
+    OS_EXIT_CRITICAL();
+    return -1;
+}
+
+static int virtio_net_wait_tx_chain_space(struct virtio_net_device *dev,
+                                          uint16_t count,
+                                          uint16_t *head_out)
+{
+    if (dev == NULL || head_out == NULL || count == 0u ||
+        count > dev->tx_queue_size) {
+        return -1;
+    }
+
+    for (uint32_t retries = 0u; retries < VIRTIO_NET_TX_CHAIN_WAIT_RETRIES; ++retries) {
+        virtio_net_reclaim_tx_used(dev);
+        /* Test the actual contiguous allocation, not just the total number of
+         * free descriptors.  Mixed one-buffer and GSO chains can fragment the
+         * circular pool. */
+        if (virtio_net_alloc_tx_chain(dev, count, head_out) == 0) {
+            return 0;
+        }
+        /* A RX task can queue several forwarded GSO chains before its burst
+         * ends.  If the descriptor pool fills before the normal end-of-burst
+         * flush, notify now so the host can return TX descriptors. */
+        virtio_net_notify_pending_tx(dev);
+        if ((retries % 10u) == 9u) {
+            OSTimeDly(1u);
+        }
+    }
+    return -1;
+}
+
+static int virtio_net_prepare_tx_gso(struct virtio_net_device *dev,
+                                     struct virtio_net_hdr *hdr,
+                                     uint8_t *payload,
+                                     size_t payload_len,
+                                     const virtio_net_gso_info_t *gso)
+{
+    size_t checksum_pos;
+    size_t ip_offset = 14u;
+    size_t ip_header_len;
+    size_t transport_len;
+    uint16_t ethertype;
+
+    if (dev == NULL || hdr == NULL || payload == NULL || gso == NULL ||
+        dev->tx_gso_offload == 0u ||
+        (gso->gso_type & (uint8_t)~VIRTIO_NET_HDR_GSO_ECN) !=
+            VIRTIO_NET_HDR_GSO_TCPV4 ||
+        gso->hdr_len < 54u || gso->hdr_len > payload_len ||
+        gso->gso_size == 0u || payload_len < ip_offset + 20u) {
+        return -1;
+    }
+
+    ethertype = virtio_net_read_be16(payload + 12u);
+    if (ethertype == 0x8100u || ethertype == 0x88A8u) {
+        ip_offset += 4u;
+        if (payload_len < ip_offset + 20u) {
+            return -1;
+        }
+        ethertype = virtio_net_read_be16(payload + 16u);
+    }
+    if (ethertype != 0x0800u || payload_len < ip_offset + 20u) {
+        return -1;
+    }
+
+    ip_header_len = (size_t)(payload[ip_offset] & 0x0Fu) * 4u;
+    if ((payload[ip_offset] >> 4u) != 4u || ip_header_len < 20u ||
+        gso->hdr_len < ip_offset + ip_header_len + 20u) {
+        return -1;
+    }
+
+    checksum_pos = (size_t)gso->csum_start + (size_t)gso->csum_offset;
+    if (checksum_pos > payload_len - sizeof(uint16_t) ||
+        gso->csum_start < ip_offset + ip_header_len) {
+        return -1;
+    }
+
+    hdr->flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
+    hdr->gso_type = gso->gso_type;
+    hdr->hdr_len = gso->hdr_len;
+    hdr->gso_size = gso->gso_size;
+    hdr->csum_start = gso->csum_start;
+    hdr->csum_offset = gso->csum_offset;
+    hdr->num_buffers = 0u;
+
+    /* The host uses the partial TCP checksum as the starting value for each
+     * generated segment.  Use one MSS-sized segment when forming the IPv4
+     * pseudo-header contribution; QEMU/vhost then completes each segment. */
+    transport_len = payload_len - ip_offset - ip_header_len;
+    if (transport_len > gso->gso_size + (gso->hdr_len - ip_offset - ip_header_len)) {
+        transport_len = gso->gso_size + (gso->hdr_len - ip_offset - ip_header_len);
+    }
+    *(uint16_t *)(payload + checksum_pos) =
+        util_htons(virtio_net_ipv4_pseudo_sum(payload + ip_offset,
+                                              6u,
+                                              (uint16_t)transport_len));
+    return 0;
+}
+
+static int virtio_net_send_tx_chain(struct virtio_net_device *dev,
+                                    const uint8_t *frame,
+                                    size_t length,
+                                    const virtio_net_gso_info_t *gso)
+{
+    struct virtio_queue *queue;
+    struct vring_avail *avail;
+    struct vring_desc *desc;
+    uint16_t needed;
+    uint16_t head;
+    size_t first_capacity = VIRTIO_NET_BUFFER_SIZE - sizeof(struct virtio_net_hdr);
+    size_t remaining = length;
+    size_t frame_offset = 0u;
+
+    if (dev == NULL || frame == NULL || length == 0u ||
+        length > VIRTIO_NET_MAX_GSO_FRAME_SIZE || dev->tx_queue_size == 0u) {
+        return -1;
+    }
+
+    needed = 1u;
+    if (length > first_capacity) {
+        size_t extra = length - first_capacity;
+        needed = (uint16_t)(needed + (extra + VIRTIO_NET_BUFFER_SIZE - 1u) /
+                            VIRTIO_NET_BUFFER_SIZE);
+    }
+    if (needed > dev->tx_queue_size) {
+        return -1;
+    }
+    if (virtio_net_wait_tx_chain_space(dev, needed, &head) != 0) {
+        uart_puts("[virtio-net] TX descriptor chain unavailable\n");
+        return -1;
+    }
+
+    queue = dev->tx_queue;
+    avail = queue->avail;
+    desc = queue->desc;
+    for (uint16_t i = 0u; i < needed; ++i) {
+        uint16_t desc_id = (uint16_t)((head + i) % dev->tx_queue_size);
+        uint8_t *buffer = dev->tx_buffers[desc_id];
+        size_t capacity = (i == 0u) ? first_capacity : VIRTIO_NET_BUFFER_SIZE;
+        size_t copy_len = (remaining < capacity) ? remaining : capacity;
+
+        if (i == 0u) {
+            struct virtio_net_hdr *hdr = (struct virtio_net_hdr *)buffer;
+            util_memset(hdr, 0, sizeof(*hdr));
+            util_memcpy(buffer + sizeof(*hdr), frame + frame_offset, copy_len);
+            if (gso != NULL) {
+                if (virtio_net_prepare_tx_gso(dev, hdr,
+                                              buffer + sizeof(*hdr), length,
+                                              gso) != 0) {
+                    virtio_net_release_tx_chain(dev, head, needed);
+                    return -1;
+                }
+            } else {
+                virtio_net_prepare_tx_csum(dev, hdr,
+                                           buffer + sizeof(*hdr), length);
+            }
+            cache_clean_range_nosync(buffer, copy_len + sizeof(*hdr));
+            desc[desc_id].len = (uint32_t)(copy_len + sizeof(*hdr));
+        } else {
+            util_memcpy(buffer, frame + frame_offset, copy_len);
+            cache_clean_range_nosync(buffer, copy_len);
+            desc[desc_id].len = (uint32_t)copy_len;
+        }
+
+        desc[desc_id].addr = (uint64_t)(uintptr_t)buffer;
+        desc[desc_id].flags = (i + 1u < needed) ? VRING_DESC_F_NEXT : 0u;
+        desc[desc_id].next = (uint16_t)((desc_id + 1u) % dev->tx_queue_size);
+        cache_clean_range_nosync(&desc[desc_id], sizeof(desc[desc_id]));
+        frame_offset += copy_len;
+        remaining -= copy_len;
+    }
+
+    OS_CPU_SR cpu_sr;
+    OS_ENTER_CRITICAL();
+    uint16_t avail_slot = (uint16_t)(avail->idx % dev->tx_queue_size);
+    avail->ring[avail_slot] = head;
+    avail->idx++;
+    cache_clean_range_nosync(&avail->ring[avail_slot], sizeof(avail->ring[avail_slot]));
+    cache_clean_range_nosync(&avail->idx, sizeof(avail->idx));
+
+    dev->tx_batch_count++;
+    if (dev->tx_batch_count >= VIRTIO_NET_TX_BATCH_SIZE) {
+        cache_sync();
+        virtio_reg_write(dev, VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_TX_QUEUE);
+        dev->tx_batch_count = 0u;
+    }
+    OS_EXIT_CRITICAL();
+    return 0;
+}
+
 /*
  * The router does not implement RX segmentation.  It can, however, accept
  * a device-supplied partial checksum because forwarded TCP/UDP packets are
@@ -746,7 +1288,13 @@ static int virtio_net_rx_hdr_accepted(struct virtio_net_device *dev,
     payload_len = (size_t)total_len - sizeof(struct virtio_net_hdr);
 
     if (hdr->gso_type != VIRTIO_NET_HDR_GSO_NONE) {
-        return 0;
+        if (dev->rx_gso_offload == 0u ||
+            (hdr->gso_type & (uint8_t)~VIRTIO_NET_HDR_GSO_ECN) !=
+                VIRTIO_NET_HDR_GSO_TCPV4 ||
+            hdr->hdr_len < 54u || hdr->gso_size == 0u ||
+            hdr->hdr_len > payload_len) {
+            return 0;
+        }
     }
 
     if ((hdr->flags & VIRTIO_NET_HDR_F_NEEDS_CSUM) == 0u) {
@@ -888,6 +1436,33 @@ static int virtio_net_init_device(size_t dev_idx, uintptr_t base_addr, uint32_t 
         uart_puts("[virtio-net] RX checksum offload enabled\n");
     } else {
         uart_puts("[virtio-net] RX checksum offload unavailable\n");
+    }
+#endif
+#if VIRTIO_NET_MRG_RXBUF
+    if (features_lo & (1u << VIRTIO_NET_F_MRG_RXBUF)) {
+        driver_features_lo |= (1u << VIRTIO_NET_F_MRG_RXBUF);
+        dev->rx_mrg_rxbuf = 1u;
+        uart_puts("[virtio-net] Mergeable RX buffers enabled\n");
+    } else {
+        uart_puts("[virtio-net] Mergeable RX buffers unavailable\n");
+    }
+#endif
+#if VIRTIO_NET_GSO_OFFLOAD
+    /* Some modern vhost paths expose the individual TCPv4 capability bits
+     * without the legacy aggregate VIRTIO_NET_F_GSO bit.  Negotiate the
+     * direction-specific bits independently; RX still requires MRG_RXBUF
+     * because a superpacket normally spans multiple 2 KiB buffers. */
+    if (dev->tx_csum_offload != 0u &&
+        (features_lo & (1u << VIRTIO_NET_F_HOST_TSO4)) != 0u) {
+        driver_features_lo |= (1u << VIRTIO_NET_F_HOST_TSO4);
+        dev->tx_gso_offload = 1u;
+        uart_puts("[virtio-net] TX TCPv4 GSO offload enabled\n");
+    }
+    if (dev->rx_mrg_rxbuf != 0u && dev->rx_csum_offload != 0u &&
+        (features_lo & (1u << VIRTIO_NET_F_GUEST_TSO4)) != 0u) {
+        driver_features_lo |= (1u << VIRTIO_NET_F_GUEST_TSO4);
+        dev->rx_gso_offload = 1u;
+        uart_puts("[virtio-net] RX TCPv4 GSO offload enabled\n");
     }
 #endif
 #if VIRTIO_NET_EVENT_IDX
@@ -1091,6 +1666,13 @@ int virtio_net_send_frame_dev(virtio_net_dev_t dev, const uint8_t *frame, size_t
         return -1;
     }
 
+    /* Once TX TCPv4 GSO is negotiated, use the descriptor allocator for
+     * ordinary frames too so a later GSO chain cannot overlap an in-flight
+     * single-descriptor submission. */
+    if (dev->tx_gso_offload != 0u) {
+        return virtio_net_send_tx_chain(dev, frame, length, NULL);
+    }
+
     struct virtio_queue *queue = dev->tx_queue;
     struct vring_avail *avail = queue->avail;
     struct vring_desc *desc = queue->desc;
@@ -1163,6 +1745,19 @@ int virtio_net_send_frame_dev(virtio_net_dev_t dev, const uint8_t *frame, size_t
     return 0;
 }
 
+int virtio_net_send_gso_frame_dev(virtio_net_dev_t dev,
+                                  const uint8_t *frame,
+                                  size_t length,
+                                  const virtio_net_gso_info_t *gso)
+{
+    if (dev == NULL || !dev->driver_ok || frame == NULL || gso == NULL ||
+        dev->tx_gso_offload == 0u || length == 0u ||
+        length > VIRTIO_NET_MAX_GSO_FRAME_SIZE) {
+        return -1;
+    }
+    return virtio_net_send_tx_chain(dev, frame, length, gso);
+}
+
 void virtio_net_tx_flush_dev(size_t dev_idx)
 {
     if (dev_idx >= g_device_count) {
@@ -1170,10 +1765,7 @@ void virtio_net_tx_flush_dev(size_t dev_idx)
     }
     struct virtio_net_device *dev = &g_devices[dev_idx];
     if (dev->tx_batch_count > 0u) {
-        cache_sync();
-        /* Keep the existing batch notify policy; spurious notify is permitted. */
-        virtio_reg_write(dev, VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_TX_QUEUE);
-        dev->tx_batch_count = 0u;
+        virtio_net_notify_pending_tx(dev);
     }
 }
 
@@ -1217,8 +1809,7 @@ int virtio_net_poll_frame_dev(virtio_net_dev_t dev, uint8_t *out_frame, size_t *
     }
 
     OS_CPU_SR cpu_sr;
-    uint16_t desc_id;
-    uint32_t total_len;
+    struct rx_completion_entry completion;
 
     OS_ENTER_CRITICAL();
     if (g_rx_completion_count[dev_idx] == 0u) {
@@ -1226,51 +1817,77 @@ int virtio_net_poll_frame_dev(virtio_net_dev_t dev, uint8_t *out_frame, size_t *
         return 0;
     }
 
-    desc_id = g_rx_completions[dev_idx][g_rx_completion_head[dev_idx]].desc_id;
-    total_len = g_rx_completions[dev_idx][g_rx_completion_head[dev_idx]].total_len;
+    util_memcpy(&completion,
+                &g_rx_completions[dev_idx][g_rx_completion_head[dev_idx]],
+                sizeof(completion));
     g_rx_completion_head[dev_idx] = (uint16_t)((g_rx_completion_head[dev_idx] + 1u) % dev->rx_queue_size);
     g_rx_completion_count[dev_idx]--;
     OS_EXIT_CRITICAL();
 
-    if (desc_id >= dev->rx_queue_size) {
+    if (completion.desc_id >= dev->rx_queue_size || completion.num_buffers == 0u ||
+        completion.num_buffers > VIRTIO_NET_RX_MAX_MRG_BUFFERS) {
         uart_puts("[virtio-net] RX completion descriptor out of range\n");
+        virtio_net_recycle_rx_completion(dev, &completion);
         return -1;
     }
 
-    size_t payload_len = 0u;
-    if (total_len > sizeof(struct virtio_net_hdr)) {
-        payload_len = total_len - sizeof(struct virtio_net_hdr);
-        if (payload_len > VIRTIO_NET_MAX_FRAME_SIZE) {
-            payload_len = VIRTIO_NET_MAX_FRAME_SIZE;
-        }
-
-        cache_invalidate_range(dev->rx_buffers[desc_id], total_len);
-
-        if (!virtio_net_rx_hdr_accepted(dev, desc_id, total_len)) {
-            uart_puts("[virtio-net] Unsupported RX checksum/GSO metadata\n");
-            virtio_net_recycle_rx_desc(dev, desc_id);
-            if (!virtio_net_has_pending_rx_dev(dev)) {
-                virtio_net_flush_rx_recycle(dev);
-            }
-            if (out_length != NULL) {
-                *out_length = 0u;
-            }
-            return -1;
-        }
-
-        if (out_frame != NULL && out_length != NULL) {
-            util_memcpy(out_frame,
-                        dev->rx_buffers[desc_id] + sizeof(struct virtio_net_hdr),
-                        payload_len);
-            *out_length = payload_len;
-        }
-    } else {
-        if (out_length != NULL) {
-            *out_length = 0u;
+    for (uint16_t i = 0u; i < completion.num_buffers; ++i) {
+        if (completion.buffer_ids[i] < dev->rx_queue_size) {
+            cache_invalidate_range(dev->rx_buffers[completion.buffer_ids[i]],
+                                   completion.buffer_lens[i]);
         }
     }
 
-    virtio_net_recycle_rx_desc(dev, desc_id);
+    size_t payload_len = (completion.total_len > sizeof(struct virtio_net_hdr)) ?
+                         (size_t)completion.total_len - sizeof(struct virtio_net_hdr) : 0u;
+    if (payload_len == 0u || payload_len > VIRTIO_NET_MAX_FRAME_SIZE ||
+        !virtio_net_rx_hdr_accepted(dev, completion.desc_id, completion.total_len)) {
+        uart_puts("[virtio-net] Unsupported RX checksum/GSO or frame size\n");
+        if (out_length != NULL) {
+            *out_length = 0u;
+        }
+        virtio_net_recycle_rx_completion(dev, &completion);
+        if (!virtio_net_has_pending_rx_dev(dev)) {
+            virtio_net_flush_rx_recycle(dev);
+        }
+        return -1;
+    }
+
+    if (out_frame != NULL && out_length != NULL) {
+        size_t dst_offset = 0u;
+        bool copy_ok = true;
+
+        for (uint16_t i = 0u; i < completion.num_buffers; ++i) {
+            size_t src_offset = (i == 0u) ? sizeof(struct virtio_net_hdr) : 0u;
+            size_t copy_len;
+
+            if (completion.buffer_lens[i] < src_offset) {
+                copy_ok = false;
+                break;
+            }
+            copy_len = (size_t)completion.buffer_lens[i] - src_offset;
+            if (dst_offset + copy_len > VIRTIO_NET_MAX_FRAME_SIZE) {
+                copy_ok = false;
+                break;
+            }
+            util_memcpy(out_frame + dst_offset,
+                        dev->rx_buffers[completion.buffer_ids[i]] + src_offset,
+                        copy_len);
+            dst_offset += copy_len;
+        }
+        if (!copy_ok || dst_offset != payload_len) {
+            uart_puts("[virtio-net] RX merged frame copy failed\n");
+            *out_length = 0u;
+            virtio_net_recycle_rx_completion(dev, &completion);
+            if (!virtio_net_has_pending_rx_dev(dev)) {
+                virtio_net_flush_rx_recycle(dev);
+            }
+            return -1;
+        }
+        *out_length = payload_len;
+    }
+
+    virtio_net_recycle_rx_completion(dev, &completion);
     /* Direct poll callers may not call rx_flush_dev() themselves. */
     if (!virtio_net_has_pending_rx_dev(dev)) {
         virtio_net_flush_rx_recycle(dev);
@@ -1297,8 +1914,7 @@ uint8_t *virtio_net_peek_rx_buffer_dev(virtio_net_dev_t dev, size_t *out_len, ui
     }
 
     OS_CPU_SR cpu_sr;
-    uint16_t desc_id;
-    uint32_t total_len;
+    struct rx_completion_entry completion;
 
     OS_ENTER_CRITICAL();
     if (g_rx_completion_count[dev_idx] == 0u) {
@@ -1306,34 +1922,112 @@ uint8_t *virtio_net_peek_rx_buffer_dev(virtio_net_dev_t dev, size_t *out_len, ui
         return NULL;
     }
 
-    desc_id = g_rx_completions[dev_idx][g_rx_completion_head[dev_idx]].desc_id;
-    total_len = g_rx_completions[dev_idx][g_rx_completion_head[dev_idx]].total_len;
+    util_memcpy(&completion,
+                &g_rx_completions[dev_idx][g_rx_completion_head[dev_idx]],
+                sizeof(completion));
     OS_EXIT_CRITICAL();
 
-    if (desc_id >= dev->rx_queue_size) {
+    if (completion.desc_id >= dev->rx_queue_size || completion.num_buffers == 0u ||
+        completion.num_buffers > VIRTIO_NET_RX_MAX_MRG_BUFFERS) {
         return NULL;
     }
 
-    size_t payload_len = 0u;
-    if (total_len > sizeof(struct virtio_net_hdr)) {
-        payload_len = total_len - sizeof(struct virtio_net_hdr);
-        if (payload_len > VIRTIO_NET_MAX_FRAME_SIZE) {
-            payload_len = VIRTIO_NET_MAX_FRAME_SIZE;
-        }
-        cache_invalidate_range(dev->rx_buffers[desc_id], total_len);
-
-        if (!virtio_net_rx_hdr_accepted(dev, desc_id, total_len)) {
-            uart_puts("[virtio-net] Unsupported RX checksum/GSO metadata\n");
-            virtio_net_release_rx_buffer_dev(dev, desc_id);
-            *out_len = 0u;
-            *out_desc_id = desc_id;
+    for (uint16_t i = 0u; i < completion.num_buffers; ++i) {
+        if (completion.buffer_ids[i] >= dev->rx_queue_size) {
             return NULL;
         }
+        cache_invalidate_range(dev->rx_buffers[completion.buffer_ids[i]],
+                               completion.buffer_lens[i]);
+    }
+
+    size_t payload_len = (completion.total_len > sizeof(struct virtio_net_hdr)) ?
+                         (size_t)completion.total_len - sizeof(struct virtio_net_hdr) : 0u;
+    if (payload_len == 0u || payload_len > VIRTIO_NET_MAX_RX_FRAME_SIZE ||
+        !virtio_net_rx_hdr_accepted(dev, completion.desc_id, completion.total_len)) {
+        uart_puts("[virtio-net] Unsupported RX checksum/GSO or frame size\n");
+        virtio_net_release_rx_buffer_dev(dev, completion.desc_id);
+        *out_len = 0u;
+        *out_desc_id = completion.desc_id;
+        return NULL;
+    }
+
+    if (completion.num_buffers > 1u) {
+        size_t dst_offset = 0u;
+        for (uint16_t i = 0u; i < completion.num_buffers; ++i) {
+            size_t src_offset = (i == 0u) ? sizeof(struct virtio_net_hdr) : 0u;
+            size_t copy_len = (size_t)completion.buffer_lens[i] - src_offset;
+
+            util_memcpy(&g_rx_merge_storage[dev_idx][dst_offset],
+                        dev->rx_buffers[completion.buffer_ids[i]] + src_offset,
+                        copy_len);
+            dst_offset += copy_len;
+        }
+        if (dst_offset != payload_len) {
+            uart_puts("[virtio-net] RX merged frame assembly failed\n");
+            virtio_net_release_rx_buffer_dev(dev, completion.desc_id);
+            *out_len = 0u;
+            *out_desc_id = completion.desc_id;
+            return NULL;
+        }
+        *out_len = payload_len;
+        *out_desc_id = completion.desc_id;
+        return g_rx_merge_storage[dev_idx];
     }
 
     *out_len = payload_len;
-    *out_desc_id = desc_id;
-    return dev->rx_buffers[desc_id] + sizeof(struct virtio_net_hdr);
+    *out_desc_id = completion.desc_id;
+    return dev->rx_buffers[completion.desc_id] + sizeof(struct virtio_net_hdr);
+}
+
+int virtio_net_get_rx_gso_info_dev(virtio_net_dev_t dev,
+                                   uint16_t desc_id,
+                                   virtio_net_gso_info_t *gso)
+{
+    size_t dev_idx = 0u;
+    struct rx_completion_entry completion;
+    struct virtio_net_hdr *hdr;
+
+    if (dev == NULL || !dev->driver_ok || gso == NULL ||
+        virtio_net_find_device_index(dev, &dev_idx) != 0) {
+        return -1;
+    }
+
+    util_memset(gso, 0, sizeof(*gso));
+    OS_CPU_SR cpu_sr;
+    OS_ENTER_CRITICAL();
+    if (g_rx_completion_count[dev_idx] == 0u) {
+        OS_EXIT_CRITICAL();
+        return 0;
+    }
+    util_memcpy(&completion,
+                &g_rx_completions[dev_idx][g_rx_completion_head[dev_idx]],
+                sizeof(completion));
+    OS_EXIT_CRITICAL();
+
+    if (completion.desc_id != desc_id || completion.num_buffers == 0u ||
+        completion.num_buffers > VIRTIO_NET_RX_MAX_MRG_BUFFERS ||
+        completion.desc_id >= dev->rx_queue_size) {
+        return -1;
+    }
+
+    cache_invalidate_range(dev->rx_buffers[completion.desc_id],
+                           completion.buffer_lens[0]);
+    if (!virtio_net_rx_hdr_accepted(dev, completion.desc_id,
+                                    completion.total_len)) {
+        return -1;
+    }
+
+    hdr = (struct virtio_net_hdr *)dev->rx_buffers[completion.desc_id];
+    if (hdr->gso_type == VIRTIO_NET_HDR_GSO_NONE) {
+        return 0;
+    }
+
+    gso->gso_type = hdr->gso_type;
+    gso->hdr_len = hdr->hdr_len;
+    gso->gso_size = hdr->gso_size;
+    gso->csum_start = hdr->csum_start;
+    gso->csum_offset = hdr->csum_offset;
+    return 1;
 }
 
 void virtio_net_release_rx_buffer_dev(virtio_net_dev_t dev, uint16_t desc_id)
@@ -1360,9 +2054,14 @@ void virtio_net_release_rx_buffer_dev(virtio_net_dev_t dev, uint16_t desc_id)
         OS_EXIT_CRITICAL();
         return;
     }
-    /* Verify the head matches the released descriptor */
-    uint16_t head_desc_id = g_rx_completions[dev_idx][g_rx_completion_head[dev_idx]].desc_id;
-    if (head_desc_id != desc_id) {
+    /* Verify the head matches the released descriptor.  A merged packet is
+     * represented by its first descriptor; releasing it returns the entire
+     * descriptor span to the available ring. */
+    struct rx_completion_entry completion;
+    util_memcpy(&completion,
+                &g_rx_completions[dev_idx][g_rx_completion_head[dev_idx]],
+                sizeof(completion));
+    if (completion.desc_id != desc_id) {
         OS_EXIT_CRITICAL();
         uart_puts("[virtio-net] RX release desc_id mismatch\n");
         return;
@@ -1371,7 +2070,7 @@ void virtio_net_release_rx_buffer_dev(virtio_net_dev_t dev, uint16_t desc_id)
     g_rx_completion_count[dev_idx]--;
     OS_EXIT_CRITICAL();
 
-    virtio_net_recycle_rx_desc(dev, desc_id);
+    virtio_net_recycle_rx_completion(dev, &completion);
 }
 
 const uint8_t *virtio_net_get_mac_dev(virtio_net_dev_t dev)
@@ -1575,7 +2274,11 @@ void virtio_net_interrupt_handler(uint32_t int_id)
 #if VIRTIO_NET_RX_DEFER_POLL
     if (interrupt_status & 0x1u) {  /* Used buffer notification */
         if (dev->tx_queue != NULL) {
-            dev->tx_last_used = virtio_net_read_tx_used_idx(dev);
+            if (dev->tx_gso_offload != 0u) {
+                virtio_net_reclaim_tx_used(dev);
+            } else {
+                dev->tx_last_used = virtio_net_read_tx_used_idx(dev);
+            }
         }
 
         /* Acknowledge before waking the task; it owns RX used-ring polling. */
@@ -1592,7 +2295,11 @@ void virtio_net_interrupt_handler(uint32_t int_id)
 #else
     if (interrupt_status & 0x1u) {  /* Used buffer notification */
         if (dev->tx_queue != NULL) {
-            dev->tx_last_used = virtio_net_read_tx_used_idx(dev);
+            if (dev->tx_gso_offload != 0u) {
+                virtio_net_reclaim_tx_used(dev);
+            } else {
+                dev->tx_last_used = virtio_net_read_tx_used_idx(dev);
+            }
         }
 
         /* Baseline: drain the RX used ring in the ISR before acknowledging. */
