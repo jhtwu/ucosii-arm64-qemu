@@ -53,7 +53,9 @@
 
 #define VIRTIO_NET_QUEUE_SIZE           256u
 #define VIRTIO_NET_BUFFER_SIZE          2048u
-#define VIRTIO_NET_TX_BATCH_SIZE        16u   /* notify host every N queued TX frames */
+#ifndef VIRTIO_NET_TX_BATCH_SIZE
+#define VIRTIO_NET_TX_BATCH_SIZE        32u   /* notify host every N queued TX frames */
+#endif
 #define VIRTIO_NET_USED_RING_STRIDE     4096u /* keep each used ring 4-byte aligned */
 
 struct virtio_net_hdr {

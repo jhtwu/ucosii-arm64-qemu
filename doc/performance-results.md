@@ -22,6 +22,7 @@
 | Cache clean no-sync + grouped barrier | 275.7 → 268.7 Mbps | -2.5% | 397.3 → 384.7 Mbps | -3.2% | fallback 狀態下沒有改善；保留作為正確的 cache ordering，並支援 vhost 路徑 |
 | Used-ring page alignment，解除 vhost fallback | 273.0 → 856.3 Mbps | **+213.7%** | 430.7 → 983.3 Mbps | **+128.3%** | **採用；本次最大且穩定的改善** |
 | TX used-index-only polling | 862.3 → 875.7 Mbps | 約 +1.5% | 1006.7 → 1050 Mbps | 約 +4.3% | 採用；降低每包 cache invalidate 範圍，但增益小於量測波動，需持續以多輪 A/B 觀察 |
+| TX notify batch size 16 → 32 | 865.3 → 922.7 Mbps | 約 **+6.6%** | 1033.3 → 1036.7 Mbps | 約 +0.3% | config sweep 與第二輪確認支持 32；已設定為 default，仍需正式 commit |
 | RX IRQ minimal + task poll | full ISR 不可持續 → 835 Mbps | N/A† | full ISR 未完成 → 975 Mbps | N/A† | **採用候選；將 RX used-ring drain 移到 task，避免單 vCPU 被 IRQ drain 佔滿** |
 | RX used-ring incremental invalidate | 850.0 → 852.0 Mbps | 約 +0.2% | 1003.5 → 988.7 Mbps | 約 -1.5% | 正確性與 cache 工作量改善，但 throughput 未見可辨識增益，暫不宣稱效能提升 |
 | RX recycle/avail-ring batching | 886 → 858 Mbps | 約 -3.2% | 1037 → 1040 Mbps | 約 +0.3% | `agy` review PASS；降低重複 cache clean，但本次 BPI A/B 未證明 throughput 收益，暫保留作候選 |
@@ -73,11 +74,23 @@
 
 相對 baseline 為 TX 約 **-3.2%**、RX 約 **+0.3%**。雙向 ping 均為 0% packet loss，6 次 iperf3 均正常完成；目前只能確認正確性與減少重複 cache clean，不能宣稱穩定 throughput 改善。
 
+### TX notify batch size config sweep 的 BPI 數據
+
+這組測試固定使用目前的 RX path，只以編譯 config `VIRTIO_NET_TX_BATCH_SIZE` 改變 TX `QUEUE_NOTIFY` 頻率；每次測試 10 秒，表中為 iperf3 receiver throughput。第一輪各設定跑 3 次，第二輪以不同順序重新確認 `16/32/64` 各 2 次：
+
+| TX batch size | 第一輪 TX mean | 第一輪 RX mean | 第二輪 TX mean | 第二輪 RX mean |
+|---:|---:|---:|---:|---:|
+| 8 | 763 Mbps | 1010 Mbps | — | — |
+| 16 | 865 Mbps | 1033 Mbps | 846 Mbps | 1050 Mbps |
+| 32 | **923 Mbps** | **1037 Mbps** | **932 Mbps** | 1035 Mbps |
+| 64 | 927 Mbps | 979 Mbps | 920 Mbps | 959 Mbps |
+
+`32` 是目前 TX/RX 平衡最好的設定；`64` 雖然 TX 接近 32，但 RX 明顯下降，`8` 則兩個方向都較慢。依 sweep 與第二輪確認，default 已改為 32。
+
 ## 未獨立量測的既有調整
 
 以下功能在本次量測開始前已存在於 branch，沒有相同條件的獨立 baseline，因此不填造改善百分比：
 
-- TX batching：每 16 個 frame 才通知一次 host。
 - RX peek/release interface：避免 RX path 立即複製到額外 buffer。
 - VirtIO queue depth：guest 端上限為 256 descriptors；QEMU 實際 queue capability 以 boot log 為準。
 
@@ -94,4 +107,4 @@
 
 ## Current decision
 
-目前保留並已 push 的主要效能修正是 used-ring alignment、cache ordering 調整、checksum path、used-index-only polling、RX IRQ minimal + task poll，以及 RX used-ring incremental invalidate（commit `121ab18`）。RX recycle/avail-ring batching 已完成 build、BPI A/B 與 `agy` review（PASS），但目前 A/B 未證明 throughput 收益，變更仍在 working tree，待決定是否保留。zero-copy forwarding 只完成候選實驗，因為在 BPI 實測明顯降低 throughput，已撤回，不會進入正式版本。
+目前保留並已 push 的主要效能修正是 used-ring alignment、cache ordering 調整、checksum path、used-index-only polling、RX IRQ minimal + task poll、RX used-ring incremental invalidate（commit `121ab18`），以及 RX recycle/avail-ring batching（commit `c0817e7`）。TX notify batch size 已由 config sweep 與第二輪確認選定 `32`，default change 尚待 commit。zero-copy forwarding 只完成候選實驗，因為在 BPI 實測明顯降低 throughput，已撤回，不會進入正式版本。
