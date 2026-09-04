@@ -43,11 +43,13 @@
 #define VIRTIO_ID_NET                   0x01u
 
 #define VIRTIO_NET_F_CSUM               0u
+#define VIRTIO_NET_F_GUEST_CSUM         1u
 #define VIRTIO_NET_F_MAC                5u
 #define VIRTIO_RING_F_EVENT_IDX         29u
 #define VIRTIO_F_VERSION_1              32u
 
 #define VIRTIO_NET_HDR_F_NEEDS_CSUM     0x01u
+#define VIRTIO_NET_HDR_GSO_NONE         0u
 #define VIRTIO_NET_TCP_CSUM_OFFSET      16u
 #define VIRTIO_NET_UDP_CSUM_OFFSET      6u
 
@@ -122,6 +124,7 @@ struct virtio_net_device {
     uint8_t mac[6];
     uint8_t driver_ok;
     uint8_t tx_csum_offload;
+    uint8_t rx_csum_offload;
     uint8_t event_idx;
     struct virtio_queue *rx_queue;
     struct virtio_queue *tx_queue;
@@ -720,6 +723,49 @@ static uint16_t virtio_net_read_tx_used_idx(struct virtio_net_device *dev)
     return used_idx;
 }
 
+/*
+ * The router does not implement RX segmentation.  It can, however, accept
+ * a device-supplied partial checksum because forwarded TCP/UDP packets are
+ * re-initialised by virtio_net_prepare_tx_csum() before TX offload.  Reject
+ * unsupported metadata rather than exposing it to the protocol path.
+ */
+static int virtio_net_rx_hdr_accepted(struct virtio_net_device *dev,
+                                      uint16_t desc_id,
+                                      uint32_t total_len)
+{
+    struct virtio_net_hdr *hdr;
+    size_t payload_len;
+    size_t checksum_pos;
+
+    if (dev == NULL || desc_id >= dev->rx_queue_size ||
+        total_len <= sizeof(struct virtio_net_hdr)) {
+        return 0;
+    }
+
+    hdr = (struct virtio_net_hdr *)dev->rx_buffers[desc_id];
+    payload_len = (size_t)total_len - sizeof(struct virtio_net_hdr);
+
+    if (hdr->gso_type != VIRTIO_NET_HDR_GSO_NONE) {
+        return 0;
+    }
+
+    if ((hdr->flags & VIRTIO_NET_HDR_F_NEEDS_CSUM) == 0u) {
+        return 1;
+    }
+
+    if (dev->rx_csum_offload == 0u) {
+        return 0;
+    }
+
+    checksum_pos = (size_t)hdr->csum_start + (size_t)hdr->csum_offset;
+    if (payload_len < sizeof(uint16_t) ||
+        checksum_pos > payload_len - sizeof(uint16_t)) {
+        return 0;
+    }
+
+    return 1;
+}
+
 static void virtio_net_arm_rx_used_event(struct virtio_net_device *dev,
                                          uint16_t used_idx)
 {
@@ -833,6 +879,15 @@ static int virtio_net_init_device(size_t dev_idx, uintptr_t base_addr, uint32_t 
         uart_puts("[virtio-net] TX checksum offload enabled\n");
     } else {
         uart_puts("[virtio-net] TX checksum offload unavailable\n");
+    }
+#endif
+#if VIRTIO_NET_RX_CSUM_OFFLOAD
+    if (features_lo & (1u << VIRTIO_NET_F_GUEST_CSUM)) {
+        driver_features_lo |= (1u << VIRTIO_NET_F_GUEST_CSUM);
+        dev->rx_csum_offload = 1u;
+        uart_puts("[virtio-net] RX checksum offload enabled\n");
+    } else {
+        uart_puts("[virtio-net] RX checksum offload unavailable\n");
     }
 #endif
 #if VIRTIO_NET_EVENT_IDX
@@ -1191,6 +1246,18 @@ int virtio_net_poll_frame_dev(virtio_net_dev_t dev, uint8_t *out_frame, size_t *
 
         cache_invalidate_range(dev->rx_buffers[desc_id], total_len);
 
+        if (!virtio_net_rx_hdr_accepted(dev, desc_id, total_len)) {
+            uart_puts("[virtio-net] Unsupported RX checksum/GSO metadata\n");
+            virtio_net_recycle_rx_desc(dev, desc_id);
+            if (!virtio_net_has_pending_rx_dev(dev)) {
+                virtio_net_flush_rx_recycle(dev);
+            }
+            if (out_length != NULL) {
+                *out_length = 0u;
+            }
+            return -1;
+        }
+
         if (out_frame != NULL && out_length != NULL) {
             util_memcpy(out_frame,
                         dev->rx_buffers[desc_id] + sizeof(struct virtio_net_hdr),
@@ -1254,6 +1321,14 @@ uint8_t *virtio_net_peek_rx_buffer_dev(virtio_net_dev_t dev, size_t *out_len, ui
             payload_len = VIRTIO_NET_MAX_FRAME_SIZE;
         }
         cache_invalidate_range(dev->rx_buffers[desc_id], total_len);
+
+        if (!virtio_net_rx_hdr_accepted(dev, desc_id, total_len)) {
+            uart_puts("[virtio-net] Unsupported RX checksum/GSO metadata\n");
+            virtio_net_release_rx_buffer_dev(dev, desc_id);
+            *out_len = 0u;
+            *out_desc_id = desc_id;
+            return NULL;
+        }
     }
 
     *out_len = payload_len;

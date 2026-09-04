@@ -31,6 +31,11 @@
 #define VIRTIO_NET_TX_CSUM_OFFLOAD        1u
 #endif
 
+/* 1: accept host RX partial-checksum metadata for supported forwarded frames. */
+#ifndef VIRTIO_NET_RX_CSUM_OFFLOAD
+#define VIRTIO_NET_RX_CSUM_OFFLOAD        1u
+#endif
+
 /* 1: use split-ring used-event fields to suppress device IRQs. */
 #ifndef VIRTIO_NET_EVENT_IDX
 #define VIRTIO_NET_EVENT_IDX              1u
