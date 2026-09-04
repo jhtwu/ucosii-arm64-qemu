@@ -26,6 +26,7 @@
 | TX TCP/UDP checksum offload step 1 | 902.2 → 910.7 Mbps | 約 **+0.9%** | 1027.0 → 1068.5 Mbps | 約 **+4.0%** | corrected BPI A/B 三次各方向均成功；只協商 `VIRTIO_NET_F_CSUM`，採用 |
 | VirtIO used-event IRQ suppression step 2 | 920.3 → 941.4 Mbps | 約 **+2.3%** | 1032.0 → 1106.7 Mbps | 約 **+7.2%** | 只使用 `used_event` 抑制裝置 IRQ；BPI A/B 12 次全數完成，採用 |
 | RX checksum offload step 3 | 904.9 → 940.0 Mbps | 約 **+3.9%** | 1036.6 → 1074.7 Mbps | 約 **+3.7%** | 協商 `VIRTIO_NET_F_GUEST_CSUM` 並驗證 RX metadata；BPI A/B 12 次全數完成，採用 |
+| Packed virtqueue candidate | 243.0 → 248.5 Mbps* | 約 +2.2%* | 242.1 → 211.1 Mbps* | 約 **-12.8%*** | 不採用；BPI `vhost=on` 不提供 packed feature，`vhost=off` 的單次對照 RX 反而下降 |
 | RX IRQ minimal + task poll | full ISR 不可持續 → 835 Mbps | N/A† | full ISR 未完成 → 975 Mbps | N/A† | **採用候選；將 RX used-ring drain 移到 task，避免單 vCPU 被 IRQ drain 佔滿** |
 | RX used-ring incremental invalidate | 850.0 → 852.0 Mbps | 約 +0.2% | 1003.5 → 988.7 Mbps | 約 -1.5% | 正確性與 cache 工作量改善，但 throughput 未見可辨識增益，暫不宣稱效能提升 |
 | RX recycle/avail-ring batching | 886 → 858 Mbps | 約 -3.2% | 1037 → 1040 Mbps | 約 +0.3% | `agy` review PASS；降低重複 cache clean，但本次 BPI A/B 未證明 throughput 收益，暫保留作候選 |
@@ -128,6 +129,19 @@ RX path 原本沒有做軟體 transport-checksum validation，因此這項不是
 | `VIRTIO_NET_RX_CSUM_OFFLOAD=1` | 933.1, 943.7, 943.1 Mbps | 940.0 Mbps | 1056.6, 1077.4, 1090.0 Mbps | 1074.7 Mbps |
 
 相對改善為 TX 約 **+3.9%**、reverse-RX 約 **+3.7%**。12 次 iperf3 全部正常完成，所有 LAN/WAN gateway ping 均為 0% packet loss；6 個 enabled guest boot log 均顯示兩張 NIC 成功協商 RX checksum offload，未出現 unsupported RX metadata。測試只建立並清除 `u14q`/`u14c`/`u14s` namespace、bridge、TAP 與 veth，未修改既有 BPI network 或 DrayOS QEMU。
+
+### Packed virtqueue candidate 的 BPI 對照
+
+這是相容性/效能候選，不是已採用的 offload。driver 新增 `VIRTIO_F_RING_PACKED` 的 opt-in，沒有 packed feature 時會 fallback 到既有 split ring。BPI 正式 `vhost=on` 的 host feature bitmap 為 `0x1c00101`，不包含 packed bit，因此實際仍使用 split ring，沒有可宣稱的 vhost throughput 改善。
+
+為確認 packed path 本身，另在與既有環境隔離的 BPI KVM namespace 使用 `vhost=off` 測試。初版 packed `DESC` event suppression 在耗盡第一輪 RX descriptors 後會停住；改成 packed RX notification `ENABLE` 後，單次 3 秒 TX/RX 均完成，但與同條件 split 對照的 receiver throughput 如下：
+
+| 狀態 | TX receiver | reverse-RX receiver |
+|---|---:|---:|
+| split | 243.0 Mbps | 242.1 Mbps |
+| packed | 248.5 Mbps | 211.1 Mbps |
+
+單次結果為 TX 約 **+2.2%**、reverse-RX 約 **-12.8%**；另一次重複腳本在第一個 run timeout，故不視為穩定改善。packed source 已全部撤回，沒有 commit/push；只保留上述測試結論，避免將不穩定且不適用 `vhost=on` 的候選帶入正式路徑。
 
 ## 未獨立量測的既有調整
 
