@@ -25,7 +25,7 @@
 | TX notify batch size 16 → 32 | 865.3 → 922.7 Mbps | 約 **+6.6%** | 1033.3 → 1036.7 Mbps | 約 +0.3% | config sweep 與第二輪確認支持 32；已設定為 default 並已 push（commit `ad272e6`） |
 | TX TCP/UDP checksum offload step 1 | 902.2 → 910.7 Mbps | 約 **+0.9%** | 1027.0 → 1068.5 Mbps | 約 **+4.0%** | corrected BPI A/B 三次各方向均成功；只協商 `VIRTIO_NET_F_CSUM`，採用 |
 | VirtIO used-event IRQ suppression step 2 | 920.3 → 941.4 Mbps | 約 **+2.3%** | 1032.0 → 1106.7 Mbps | 約 **+7.2%** | 只使用 `used_event` 抑制裝置 IRQ；BPI A/B 12 次全數完成，採用 |
-| RX checksum offload step 3 | 904.9 → 940.0 Mbps | 約 **+3.9%** | 1036.6 → 1074.7 Mbps | 約 **+3.7%** | 協商 `VIRTIO_NET_F_GUEST_CSUM` 並驗證 RX metadata；BPI A/B 12 次全數完成，採用候選 |
+| RX checksum offload step 3 | 904.9 → 940.0 Mbps | 約 **+3.9%** | 1036.6 → 1074.7 Mbps | 約 **+3.7%** | 協商 `VIRTIO_NET_F_GUEST_CSUM` 並驗證 RX metadata；BPI A/B 12 次全數完成，採用 |
 | RX IRQ minimal + task poll | full ISR 不可持續 → 835 Mbps | N/A† | full ISR 未完成 → 975 Mbps | N/A† | **採用候選；將 RX used-ring drain 移到 task，避免單 vCPU 被 IRQ drain 佔滿** |
 | RX used-ring incremental invalidate | 850.0 → 852.0 Mbps | 約 +0.2% | 1003.5 → 988.7 Mbps | 約 -1.5% | 正確性與 cache 工作量改善，但 throughput 未見可辨識增益，暫不宣稱效能提升 |
 | RX recycle/avail-ring batching | 886 → 858 Mbps | 約 -3.2% | 1037 → 1040 Mbps | 約 +0.3% | `agy` review PASS；降低重複 cache clean，但本次 BPI A/B 未證明 throughput 收益，暫保留作候選 |
@@ -149,4 +149,4 @@ RX path 原本沒有做軟體 transport-checksum validation，因此這項不是
 
 ## Current decision
 
-目前保留並已 push 的主要效能修正是 used-ring alignment、cache ordering 調整、checksum path、used-index-only polling、RX IRQ minimal + task poll、RX used-ring incremental invalidate（commit `121ab18`），RX recycle/avail-ring batching（commit `c0817e7`），以及 TX notify batch size 32（commit `ad272e6`）。TX checksum offload step 1 已完成 corrected BPI A/B、TCP/UDP raw checksum 驗證與 agy review PASS，確認 reverse-RX 約 4.0% 改善、TX 約 0.9% 改善。step 2 的 used-event-only IRQ suppression 已完成 BPI A/B 與 agy review PASS，並已 commit/push（commit `8c639f2`）：TX 約 +2.3%、reverse-RX 約 +7.2%。step 3 RX checksum offload 已完成 final source BPI A/B：TX 約 +3.9%、reverse-RX 約 +3.7%，待 agy review 後 commit/push。zero-copy forwarding 只完成候選實驗，因為在 BPI 實測明顯降低 throughput，已撤回，不會進入正式版本。
+目前保留並已 push 的主要效能修正是 used-ring alignment、cache ordering 調整、checksum path、used-index-only polling、RX IRQ minimal + task poll、RX used-ring incremental invalidate（commit `121ab18`），RX recycle/avail-ring batching（commit `c0817e7`），以及 TX notify batch size 32（commit `ad272e6`）。TX checksum offload step 1 已完成 corrected BPI A/B、TCP/UDP raw checksum 驗證與 agy review PASS，確認 reverse-RX 約 4.0% 改善、TX 約 0.9% 改善。step 2 的 used-event-only IRQ suppression 已完成 BPI A/B 與 agy review PASS，並已 commit/push（commit `8c639f2`）：TX 約 +2.3%、reverse-RX 約 +7.2%。step 3 RX checksum offload 已完成 final source BPI A/B、agy review PASS，並已 commit/push（commit `77bc1f0`）：TX 約 +3.9%、reverse-RX 約 +3.7%。zero-copy forwarding 只完成候選實驗，因為在 BPI 實測明顯降低 throughput，已撤回，不會進入正式版本。
