@@ -42,8 +42,13 @@
 
 #define VIRTIO_ID_NET                   0x01u
 
+#define VIRTIO_NET_F_CSUM               0u
 #define VIRTIO_NET_F_MAC                5u
 #define VIRTIO_F_VERSION_1              32u
+
+#define VIRTIO_NET_HDR_F_NEEDS_CSUM     0x01u
+#define VIRTIO_NET_TCP_CSUM_OFFSET      16u
+#define VIRTIO_NET_UDP_CSUM_OFFSET      6u
 
 #define VRING_DESC_F_NEXT               0x01u
 #define VRING_DESC_F_WRITE              0x02u
@@ -115,6 +120,7 @@ struct virtio_net_device {
     uint16_t tx_last_used;
     uint8_t mac[6];
     uint8_t driver_ok;
+    uint8_t tx_csum_offload;
     struct virtio_queue *rx_queue;
     struct virtio_queue *tx_queue;
     uint8_t *rx_buffers[VIRTIO_NET_QUEUE_SIZE];
@@ -218,6 +224,129 @@ static void log_status(const char *label, uint32_t status)
     uart_puts(" status=0x");
     uart_write_hex((unsigned long)status);
     uart_putc('\n');
+}
+
+static uint16_t virtio_net_read_be16(const uint8_t *data)
+{
+    return (uint16_t)(((uint16_t)data[0] << 8u) | (uint16_t)data[1]);
+}
+
+/* Return the non-complemented one's-complement sum of an IPv4 L4 pseudo-header. */
+static uint16_t virtio_net_ipv4_pseudo_sum(const uint8_t *ip,
+                                           uint8_t protocol,
+                                           uint16_t transport_len)
+{
+    uint32_t sum = 0u;
+
+    sum += virtio_net_read_be16(ip + 12u);
+    sum += virtio_net_read_be16(ip + 14u);
+    sum += virtio_net_read_be16(ip + 16u);
+    sum += virtio_net_read_be16(ip + 18u);
+    sum += (uint32_t)protocol;
+    sum += (uint32_t)transport_len;
+
+    while ((sum >> 16u) != 0u) {
+        sum = (sum & 0xFFFFu) + (sum >> 16u);
+    }
+
+    return (uint16_t)sum;
+}
+
+/*
+ * Prepare the legacy virtio-net header for a single-packet TX checksum
+ * offload.  IPv4 checksum and NAT header updates remain guest-owned; the
+ * host only fills the TCP/UDP checksum field described by this header.
+ */
+static void virtio_net_prepare_tx_csum(struct virtio_net_device *dev,
+                                       struct virtio_net_hdr *hdr,
+                                       uint8_t *payload,
+                                       size_t payload_len)
+{
+    size_t l2_len = 14u;
+    size_t ip_offset;
+    size_t ip_header_len;
+    size_t transport_offset;
+    size_t transport_len;
+    uint16_t ethertype;
+    uint16_t ip_total_len;
+    uint8_t protocol;
+    uint16_t *checksum;
+
+    if (dev == NULL || dev->tx_csum_offload == 0u || payload == NULL ||
+        payload_len < l2_len + 20u) {
+        return;
+    }
+
+    ethertype = virtio_net_read_be16(payload + 12u);
+    if (ethertype == 0x8100u || ethertype == 0x88A8u) {
+        if (payload_len < l2_len + 4u + 20u) {
+            return;
+        }
+        l2_len += 4u;
+        ethertype = virtio_net_read_be16(payload + 16u);
+    }
+    if (ethertype != 0x0800u) {
+        return;
+    }
+
+    ip_offset = l2_len;
+    ip_header_len = (size_t)(payload[ip_offset] & 0x0Fu) * 4u;
+    if ((payload[ip_offset] >> 4u) != 4u || ip_header_len < 20u ||
+        payload_len < ip_offset + ip_header_len) {
+        return;
+    }
+
+    ip_total_len = virtio_net_read_be16(payload + ip_offset + 2u);
+    if (ip_total_len < ip_header_len ||
+        (size_t)ip_total_len != payload_len - ip_offset) {
+        return;
+    }
+
+    /* A fragmented IPv4 packet has no safely addressable L4 checksum field. */
+    if ((virtio_net_read_be16(payload + ip_offset + 6u) & 0x3FFFu) != 0u) {
+        return;
+    }
+
+    protocol = payload[ip_offset + 9u];
+    transport_offset = ip_offset + ip_header_len;
+    transport_len = (size_t)ip_total_len - ip_header_len;
+    if (protocol == 6u) {
+        if (transport_len < 20u) {
+            return;
+        }
+        size_t tcp_header_len = (size_t)(payload[transport_offset + 12u] >> 4u) * 4u;
+        if (tcp_header_len < 20u || tcp_header_len > transport_len) {
+            return;
+        }
+        checksum = (uint16_t *)(payload + transport_offset + 16u);
+        hdr->flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
+        hdr->csum_start = (uint16_t)transport_offset;
+        hdr->csum_offset = VIRTIO_NET_TCP_CSUM_OFFSET;
+        /* VirtIO expects the pseudo-header sum in the checksum field. */
+        *checksum = util_htons(virtio_net_ipv4_pseudo_sum(payload + ip_offset,
+                                                          protocol,
+                                                          (uint16_t)transport_len));
+    } else if (protocol == 17u) {
+        if (transport_len < 8u) {
+            return;
+        }
+        if ((size_t)virtio_net_read_be16(payload + transport_offset + 4u) !=
+            transport_len) {
+            return;
+        }
+        checksum = (uint16_t *)(payload + transport_offset + 6u);
+        /* An IPv4 UDP checksum of zero explicitly disables the checksum. */
+        if (*checksum == 0u) {
+            return;
+        }
+        hdr->flags = VIRTIO_NET_HDR_F_NEEDS_CSUM;
+        hdr->csum_start = (uint16_t)transport_offset;
+        hdr->csum_offset = VIRTIO_NET_UDP_CSUM_OFFSET;
+        /* VirtIO expects the pseudo-header sum in the checksum field. */
+        *checksum = util_htons(virtio_net_ipv4_pseudo_sum(payload + ip_offset,
+                                                          protocol,
+                                                          (uint16_t)transport_len));
+    }
 }
 
 static int virtio_net_scan(uintptr_t *base_out, uint32_t *irq_out, size_t start_index)
@@ -658,6 +787,15 @@ static int virtio_net_init_device(size_t dev_idx, uintptr_t base_addr, uint32_t 
 
     uint32_t driver_features_lo = 0u;
     uint32_t driver_features_hi = 0u;
+#if VIRTIO_NET_TX_CSUM_OFFLOAD
+    if (features_lo & (1u << VIRTIO_NET_F_CSUM)) {
+        driver_features_lo |= (1u << VIRTIO_NET_F_CSUM);
+        dev->tx_csum_offload = 1u;
+        uart_puts("[virtio-net] TX checksum offload enabled\n");
+    } else {
+        uart_puts("[virtio-net] TX checksum offload unavailable\n");
+    }
+#endif
     if (features_lo & (1u << VIRTIO_NET_F_MAC)) {
         driver_features_lo |= (1u << VIRTIO_NET_F_MAC);
     }
@@ -833,6 +971,11 @@ size_t virtio_net_get_device_count(void)
     return g_device_count;
 }
 
+int virtio_net_tx_csum_offload_enabled_dev(virtio_net_dev_t dev)
+{
+    return (dev != NULL && dev->driver_ok && dev->tx_csum_offload != 0u) ? 1 : 0;
+}
+
 int virtio_net_send_frame_dev(virtio_net_dev_t dev, const uint8_t *frame, size_t length)
 {
     if (dev == NULL || !dev->driver_ok) {
@@ -892,6 +1035,7 @@ int virtio_net_send_frame_dev(virtio_net_dev_t dev, const uint8_t *frame, size_t
 
     util_memset(hdr, 0, sizeof(*hdr));
     util_memcpy(buffer + sizeof(*hdr), frame, length);
+    virtio_net_prepare_tx_csum(dev, hdr, buffer + sizeof(*hdr), length);
     cache_clean_range_nosync(buffer, length + sizeof(*hdr));
 
     desc[idx].addr = (uint64_t)(uintptr_t)buffer;
@@ -1018,7 +1162,7 @@ int virtio_net_poll_frame_dev(virtio_net_dev_t dev, uint8_t *out_frame, size_t *
     return (payload_len > 0u) ? 1 : 0;
 }
 
-const uint8_t *virtio_net_peek_rx_buffer_dev(virtio_net_dev_t dev, size_t *out_len, uint16_t *out_desc_id)
+uint8_t *virtio_net_peek_rx_buffer_dev(virtio_net_dev_t dev, size_t *out_len, uint16_t *out_desc_id)
 {
     if (dev == NULL || !dev->driver_ok || out_len == NULL || out_desc_id == NULL) {
         return NULL;

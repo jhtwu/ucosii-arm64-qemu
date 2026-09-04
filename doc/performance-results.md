@@ -22,7 +22,8 @@
 | Cache clean no-sync + grouped barrier | 275.7 → 268.7 Mbps | -2.5% | 397.3 → 384.7 Mbps | -3.2% | fallback 狀態下沒有改善；保留作為正確的 cache ordering，並支援 vhost 路徑 |
 | Used-ring page alignment，解除 vhost fallback | 273.0 → 856.3 Mbps | **+213.7%** | 430.7 → 983.3 Mbps | **+128.3%** | **採用；本次最大且穩定的改善** |
 | TX used-index-only polling | 862.3 → 875.7 Mbps | 約 +1.5% | 1006.7 → 1050 Mbps | 約 +4.3% | 採用；降低每包 cache invalidate 範圍，但增益小於量測波動，需持續以多輪 A/B 觀察 |
-| TX notify batch size 16 → 32 | 865.3 → 922.7 Mbps | 約 **+6.6%** | 1033.3 → 1036.7 Mbps | 約 +0.3% | config sweep 與第二輪確認支持 32；已設定為 default，仍需正式 commit |
+| TX notify batch size 16 → 32 | 865.3 → 922.7 Mbps | 約 **+6.6%** | 1033.3 → 1036.7 Mbps | 約 +0.3% | config sweep 與第二輪確認支持 32；已設定為 default 並已 push（commit `ad272e6`） |
+| TX TCP/UDP checksum offload step 1 | 902.2 → 910.7 Mbps | 約 **+0.9%** | 1027.0 → 1068.5 Mbps | 約 **+4.0%** | corrected BPI A/B 三次各方向均成功；只協商 `VIRTIO_NET_F_CSUM`，採用 |
 | RX IRQ minimal + task poll | full ISR 不可持續 → 835 Mbps | N/A† | full ISR 未完成 → 975 Mbps | N/A† | **採用候選；將 RX used-ring drain 移到 task，避免單 vCPU 被 IRQ drain 佔滿** |
 | RX used-ring incremental invalidate | 850.0 → 852.0 Mbps | 約 +0.2% | 1003.5 → 988.7 Mbps | 約 -1.5% | 正確性與 cache 工作量改善，但 throughput 未見可辨識增益，暫不宣稱效能提升 |
 | RX recycle/avail-ring batching | 886 → 858 Mbps | 約 -3.2% | 1037 → 1040 Mbps | 約 +0.3% | `agy` review PASS；降低重複 cache clean，但本次 BPI A/B 未證明 throughput 收益，暫保留作候選 |
@@ -87,6 +88,19 @@
 
 `32` 是目前 TX/RX 平衡最好的設定；`64` 雖然 TX 接近 32，但 RX 明顯下降，`8` 則兩個方向都較慢。依 sweep 與第二輪確認，default 已改為 32。
 
+### TX checksum offload step 1 的 BPI A/B 數據
+
+這組 corrected 測試固定使用 BPI-R4 KVM/vhost、1 vCPU、512 MiB、兩張 VirtIO-net；QEMU 只明確開啟 `csum=on`，並關閉 GSO/TSO、guest checksum、mergeable RX buffer，避免混入其他 offload。只比較編譯 config `VIRTIO_NET_TX_CSUM_OFFLOAD=0/1`，每個方向各跑 3 次、每次測試重新啟動一個 guest，避免 TX queue 狀態跨輪污染。
+
+| 狀態 | TX runs（LAN → WAN） | TX mean | reverse-RX runs（WAN → LAN） | reverse-RX mean |
+|---|---|---:|---|---:|
+| checksum offload disabled | 899.1, 898.0, 909.5 Mbps | 902.2 Mbps | 1038.5, 1023.7, 1018.9 Mbps | 1027.0 Mbps |
+| checksum offload enabled | 895.1, 915.7, 921.3 Mbps | 910.7 Mbps | 1090.0, 1039.9, 1075.8 Mbps | 1068.5 Mbps |
+
+相對改善為 TX 約 **+0.9%**、reverse-RX 約 **+4.0%**。兩個版本的 12 次 iperf3 均正常完成，所有 LAN/WAN gateway ping 均為 0% packet loss；offload enabled 的每個 guest boot log 都顯示兩次 `TX checksum offload enabled`。這一項只把 IPv4 TCP/UDP transport checksum 交給 host，IPv4 header checksum 與 NAT header 更新仍由 guest 完成。
+
+另以 offload enabled image 做 raw packet capture：在只屬於測試 namespace 的 WAN veth 關閉 TX checksum/GSO/GRO/TSO 後，guest → WAN 的 TCP 封包均被 tcpdump 判定為 `cksum correct`，UDP 封包均顯示 `[udp sum ok]`。未關閉該 veth offload 時看到的 pseudo-header partial checksum 是預期的 VirtIO 傳輸中間狀態，不是 wire checksum failure。測試只建立並清除 `ucsi5`/`ucsi7`/`ucsi8` namespace、bridge、TAP 與 veth，未修改既有 BPI network 或 DrayOS QEMU。
+
 ## 未獨立量測的既有調整
 
 以下功能在本次量測開始前已存在於 branch，沒有相同條件的獨立 baseline，因此不填造改善百分比：
@@ -107,4 +121,4 @@
 
 ## Current decision
 
-目前保留並已 push 的主要效能修正是 used-ring alignment、cache ordering 調整、checksum path、used-index-only polling、RX IRQ minimal + task poll、RX used-ring incremental invalidate（commit `121ab18`），以及 RX recycle/avail-ring batching（commit `c0817e7`）。TX notify batch size 已由 config sweep 與第二輪確認選定 `32`，default change 尚待 commit。zero-copy forwarding 只完成候選實驗，因為在 BPI 實測明顯降低 throughput，已撤回，不會進入正式版本。
+目前保留並已 push 的主要效能修正是 used-ring alignment、cache ordering 調整、checksum path、used-index-only polling、RX IRQ minimal + task poll、RX used-ring incremental invalidate（commit `121ab18`），RX recycle/avail-ring batching（commit `c0817e7`），以及 TX notify batch size 32（commit `ad272e6`）。TX checksum offload step 1 已完成 corrected BPI A/B、TCP/UDP raw checksum 驗證與 agy review PASS，確認 reverse-RX 約 4.0% 改善、TX 約 0.9% 改善。zero-copy forwarding 只完成候選實驗，因為在 BPI 實測明顯降低 throughput，已撤回，不會進入正式版本。

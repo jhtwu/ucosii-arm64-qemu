@@ -26,6 +26,11 @@
 #error "VIRTIO_NET_RX_RECYCLE_BATCH_SIZE must be at least 1"
 #endif
 
+/* 1: ask the host to complete IPv4 TCP/UDP TX checksums when supported. */
+#ifndef VIRTIO_NET_TX_CSUM_OFFLOAD
+#define VIRTIO_NET_TX_CSUM_OFFLOAD        1u
+#endif
+
 /* Maximum number of VirtIO network devices supported */
 #define VIRTIO_NET_MAX_DEVICES         2u
 
@@ -46,6 +51,7 @@ size_t virtio_net_get_device_count(void);
 
 /* Device-specific operations */
 int virtio_net_send_frame_dev(virtio_net_dev_t dev, const uint8_t *frame, size_t length);
+int virtio_net_tx_csum_offload_enabled_dev(virtio_net_dev_t dev);
 int virtio_net_poll_rx_dev(virtio_net_dev_t dev);
 int virtio_net_poll_frame_dev(virtio_net_dev_t dev, uint8_t *out_frame, size_t *out_length);
 const uint8_t *virtio_net_get_mac_dev(virtio_net_dev_t dev);
@@ -56,7 +62,7 @@ INT8U virtio_net_wait_rx_any(uint16_t timeout_ms);
 void virtio_net_tx_flush_dev(size_t dev_idx);
 void virtio_net_tx_flush_device(virtio_net_dev_t dev);
 void virtio_net_rx_flush_dev(size_t dev_idx);
-const uint8_t *virtio_net_peek_rx_buffer_dev(virtio_net_dev_t dev, size_t *out_len, uint16_t *out_desc_id);
+uint8_t *virtio_net_peek_rx_buffer_dev(virtio_net_dev_t dev, size_t *out_len, uint16_t *out_desc_id);
 void virtio_net_release_rx_buffer_dev(virtio_net_dev_t dev, uint16_t desc_id);
 
 /* Legacy single-device operations (operate on device 0) */

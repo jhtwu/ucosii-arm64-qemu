@@ -462,6 +462,11 @@ static int net_demo_process_frame(struct net_interface *iface,
             return 0;
         }
 
+        /* Fragment reassembly is not implemented by this forwarding path. */
+        if ((util_ntohs(ip->flags_fragment) & 0x3FFFu) != 0u) {
+            return 0;
+        }
+
         /* Learn source IP-MAC mapping from IP packets (for NAT reverse lookup) */
         arp_cache_add(ip->src, eth->src);
 
@@ -587,20 +592,24 @@ static int net_demo_process_frame(struct net_interface *iface,
                                                                             fwd_ip->ttl,
                                                                             fwd_ip->protocol);
                             fwd_tcp->dst_port = util_htons(lan_port);
-                            fwd_tcp->checksum = checksum_replace32(fwd_tcp->checksum,
-                                                                   old_dst_ip,
-                                                                   fwd_ip->dst);
-                            fwd_tcp->checksum = checksum_replace16(fwd_tcp->checksum,
-                                                                    old_dst_port,
-                                                                    fwd_tcp->dst_port);
+                            if (!virtio_net_tx_csum_offload_enabled_dev(g_lan_if.dev)) {
+                                fwd_tcp->checksum = checksum_replace32(fwd_tcp->checksum,
+                                                                       old_dst_ip,
+                                                                       fwd_ip->dst);
+                                fwd_tcp->checksum = checksum_replace16(fwd_tcp->checksum,
+                                                                        old_dst_port,
+                                                                        fwd_tcp->dst_port);
+                            }
                         } else {
                             struct udp_header *fwd_udp = (struct udp_header *)((uint8_t *)fwd_ip + ip_header_len);
                             fwd_ip->header_checksum = 0u;
                             fwd_ip->header_checksum = util_htons(checksum16(fwd_ip, ip_header_len));
                             fwd_udp->dst_port = util_htons(lan_port);
-                            fwd_udp->checksum = 0u;
-                            size_t udp_len = total_length - ip_header_len;
-                            fwd_udp->checksum = tcp_udp_checksum(fwd_ip, fwd_udp, udp_len);  /* Direct assignment */
+                            if (!virtio_net_tx_csum_offload_enabled_dev(g_lan_if.dev)) {
+                                fwd_udp->checksum = 0u;
+                                size_t udp_len = total_length - ip_header_len;
+                                fwd_udp->checksum = tcp_udp_checksum(fwd_ip, fwd_udp, udp_len);
+                            }
                         }
 
                         /* Send on LAN interface */
@@ -751,20 +760,24 @@ static int net_demo_process_frame(struct net_interface *iface,
                                                                                     fwd_ip->ttl,
                                                                                     fwd_ip->protocol);
                                     fwd_tcp->src_port = util_htons(wan_port);
-                                    fwd_tcp->checksum = checksum_replace32(fwd_tcp->checksum,
-                                                                           old_src_ip,
-                                                                           fwd_ip->src);
-                                    fwd_tcp->checksum = checksum_replace16(fwd_tcp->checksum,
-                                                                            old_src_port,
-                                                                            fwd_tcp->src_port);
+                                    if (!virtio_net_tx_csum_offload_enabled_dev(g_wan_if.dev)) {
+                                        fwd_tcp->checksum = checksum_replace32(fwd_tcp->checksum,
+                                                                               old_src_ip,
+                                                                               fwd_ip->src);
+                                        fwd_tcp->checksum = checksum_replace16(fwd_tcp->checksum,
+                                                                                old_src_port,
+                                                                                fwd_tcp->src_port);
+                                    }
                                 } else {
                                     struct udp_header *fwd_udp = (struct udp_header *)((uint8_t *)fwd_ip + ip_header_len);
                                     fwd_ip->header_checksum = 0u;
                                     fwd_ip->header_checksum = util_htons(checksum16(fwd_ip, ip_header_len));
                                     fwd_udp->src_port = util_htons(wan_port);
-                                    fwd_udp->checksum = 0u;
-                                    size_t udp_len = total_length - ip_header_len;
-                                    fwd_udp->checksum = tcp_udp_checksum(fwd_ip, fwd_udp, udp_len);  /* Direct assignment */
+                                    if (!virtio_net_tx_csum_offload_enabled_dev(g_wan_if.dev)) {
+                                        fwd_udp->checksum = 0u;
+                                        size_t udp_len = total_length - ip_header_len;
+                                        fwd_udp->checksum = tcp_udp_checksum(fwd_ip, fwd_udp, udp_len);
+                                    }
                                 }
 
                                 /* Send on WAN interface */
@@ -890,20 +903,24 @@ static int net_demo_process_frame(struct net_interface *iface,
                                                                                     fwd_ip->ttl,
                                                                                     fwd_ip->protocol);
                                     fwd_tcp->dst_port = util_htons(lan_port);
-                                    fwd_tcp->checksum = checksum_replace32(fwd_tcp->checksum,
-                                                                           old_dst_ip,
-                                                                           fwd_ip->dst);
-                                    fwd_tcp->checksum = checksum_replace16(fwd_tcp->checksum,
-                                                                            old_dst_port,
-                                                                            fwd_tcp->dst_port);
+                                    if (!virtio_net_tx_csum_offload_enabled_dev(g_lan_if.dev)) {
+                                        fwd_tcp->checksum = checksum_replace32(fwd_tcp->checksum,
+                                                                               old_dst_ip,
+                                                                               fwd_ip->dst);
+                                        fwd_tcp->checksum = checksum_replace16(fwd_tcp->checksum,
+                                                                                old_dst_port,
+                                                                                fwd_tcp->dst_port);
+                                    }
                                 } else {
                                     struct udp_header *fwd_udp = (struct udp_header *)((uint8_t *)fwd_ip + ip_header_len);
                                     fwd_ip->header_checksum = 0u;
                                     fwd_ip->header_checksum = util_htons(checksum16(fwd_ip, ip_header_len));
                                     fwd_udp->dst_port = util_htons(lan_port);
-                                    fwd_udp->checksum = 0u;
-                                    size_t udp_len = total_length - ip_header_len;
-                                    fwd_udp->checksum = tcp_udp_checksum(fwd_ip, fwd_udp, udp_len);  /* Direct assignment */
+                                    if (!virtio_net_tx_csum_offload_enabled_dev(g_lan_if.dev)) {
+                                        fwd_udp->checksum = 0u;
+                                        size_t udp_len = total_length - ip_header_len;
+                                        fwd_udp->checksum = tcp_udp_checksum(fwd_ip, fwd_udp, udp_len);
+                                    }
                                 }
 
                                 /* Send on LAN interface */
@@ -974,8 +991,6 @@ static void net_demo_send_icmp_request(struct net_interface *iface, uint16_t seq
 static void net_rx_task(void *p_arg)
 {
     struct net_interface *iface = (struct net_interface *)p_arg;
-    uint8_t rx_buffer[VIRTIO_NET_MAX_FRAME_SIZE];
-    size_t rx_length = 0u;
 
     for (;;) {
         if (iface == NULL || iface->dev == NULL) {
@@ -990,7 +1005,7 @@ static void net_rx_task(void *p_arg)
         while (virtio_net_has_pending_rx_dev(iface->dev)) {
             uint16_t desc_id = 0u;
             size_t len = 0u;
-            const uint8_t *frame = virtio_net_peek_rx_buffer_dev(iface->dev, &len, &desc_id);
+            uint8_t *frame = virtio_net_peek_rx_buffer_dev(iface->dev, &len, &desc_id);
             if (frame != NULL && len > 0u) {
                 net_demo_process_frame(iface, frame, len);
                 virtio_net_release_rx_buffer_dev(iface->dev, desc_id);
