@@ -44,6 +44,7 @@
 
 #define VIRTIO_NET_F_CSUM               0u
 #define VIRTIO_NET_F_MAC                5u
+#define VIRTIO_RING_F_EVENT_IDX         29u
 #define VIRTIO_F_VERSION_1              32u
 
 #define VIRTIO_NET_HDR_F_NEEDS_CSUM     0x01u
@@ -121,6 +122,7 @@ struct virtio_net_device {
     uint8_t mac[6];
     uint8_t driver_ok;
     uint8_t tx_csum_offload;
+    uint8_t event_idx;
     struct virtio_queue *rx_queue;
     struct virtio_queue *tx_queue;
     uint8_t *rx_buffers[VIRTIO_NET_QUEUE_SIZE];
@@ -179,6 +181,9 @@ static volatile uint16_t g_rx_completion_count[VIRTIO_NET_MAX_DEVICES] = {0u};
 
 /* Legacy single device pointer (points to device 0) */
 static struct virtio_net_device *g_dev = NULL;
+
+static void virtio_net_arm_rx_used_event(struct virtio_net_device *dev,
+                                         uint16_t used_idx);
 
 static inline uint32_t virtio_mmio_read32(uintptr_t base, uint32_t offset)
 {
@@ -496,6 +501,7 @@ static void virtio_net_flush_rx_recycle(struct virtio_net_device *dev)
     /* Publish all ring entries before exposing the new avail index. */
     cache_clean_range_nosync(&avail->idx, sizeof(avail->idx));
     cache_sync();
+    /* Keep the existing batch notify policy; spurious notify is permitted. */
     virtio_reg_write(dev, VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_RX_QUEUE);
     dev->rx_recycle_count = 0u;
 }
@@ -576,6 +582,7 @@ static int virtio_net_drain_rx_used(struct virtio_net_device *dev, size_t dev_id
          * overwritten or its index is corrupt; do not spin around it. */
         uart_puts("[virtio-net] RX used ring overrun\n");
         dev->rx_last_used = used_idx;
+        virtio_net_arm_rx_used_event(dev, used_idx);
         return -1;
     }
 
@@ -612,6 +619,8 @@ static int virtio_net_drain_rx_used(struct virtio_net_device *dev, size_t dev_id
 
         dev->rx_last_used++;
     }
+
+    virtio_net_arm_rx_used_event(dev, used_idx);
 
     return enqueued;
 }
@@ -698,7 +707,37 @@ static uint16_t virtio_net_read_tx_used_idx(struct virtio_net_device *dev)
     struct vring_used *used = dev->tx_queue->used;
 
     cache_invalidate_range(&used->idx, sizeof(used->idx));
-    return used->idx;
+    uint16_t used_idx = used->idx;
+
+    if (dev->event_idx != 0u && dev->tx_queue->avail->used_event != used_idx) {
+        /* Arm the next TX completion interrupt only after observing this one. */
+        dev->tx_queue->avail->used_event = used_idx;
+        cache_clean_range_nosync(&dev->tx_queue->avail->used_event,
+                                 sizeof(dev->tx_queue->avail->used_event));
+        cache_sync();
+    }
+
+    return used_idx;
+}
+
+static void virtio_net_arm_rx_used_event(struct virtio_net_device *dev,
+                                         uint16_t used_idx)
+{
+    struct vring_avail *avail;
+
+    if (dev == NULL || dev->event_idx == 0u) {
+        return;
+    }
+
+    avail = dev->rx_queue->avail;
+    if (avail->used_event == used_idx) {
+        return;
+    }
+
+    /* Ask the device to interrupt again only after a new used entry appears. */
+    avail->used_event = used_idx;
+    cache_clean_range_nosync(&avail->used_event, sizeof(avail->used_event));
+    cache_sync();
 }
 
 static int virtio_net_init_device(size_t dev_idx, uintptr_t base_addr, uint32_t irq)
@@ -794,6 +833,15 @@ static int virtio_net_init_device(size_t dev_idx, uintptr_t base_addr, uint32_t 
         uart_puts("[virtio-net] TX checksum offload enabled\n");
     } else {
         uart_puts("[virtio-net] TX checksum offload unavailable\n");
+    }
+#endif
+#if VIRTIO_NET_EVENT_IDX
+    if (features_lo & (1u << VIRTIO_RING_F_EVENT_IDX)) {
+        driver_features_lo |= (1u << VIRTIO_RING_F_EVENT_IDX);
+        dev->event_idx = 1u;
+        uart_puts("[virtio-net] Virtqueue used-event IRQ suppression enabled\n");
+    } else {
+        uart_puts("[virtio-net] Virtqueue event-index unavailable\n");
     }
 #endif
     if (features_lo & (1u << VIRTIO_NET_F_MAC)) {
@@ -1052,6 +1100,7 @@ int virtio_net_send_frame_dev(virtio_net_dev_t dev, const uint8_t *frame, size_t
     dev->tx_batch_count++;
     if (dev->tx_batch_count >= VIRTIO_NET_TX_BATCH_SIZE) {
         cache_sync();
+        /* Keep the existing batch notify policy; spurious notify is permitted. */
         virtio_reg_write(dev, VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_TX_QUEUE);
         dev->tx_batch_count = 0u;
     }
@@ -1067,6 +1116,7 @@ void virtio_net_tx_flush_dev(size_t dev_idx)
     struct virtio_net_device *dev = &g_devices[dev_idx];
     if (dev->tx_batch_count > 0u) {
         cache_sync();
+        /* Keep the existing batch notify policy; spurious notify is permitted. */
         virtio_reg_write(dev, VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_TX_QUEUE);
         dev->tx_batch_count = 0u;
     }

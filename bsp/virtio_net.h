@@ -31,6 +31,11 @@
 #define VIRTIO_NET_TX_CSUM_OFFLOAD        1u
 #endif
 
+/* 1: use split-ring used-event fields to suppress device IRQs. */
+#ifndef VIRTIO_NET_EVENT_IDX
+#define VIRTIO_NET_EVENT_IDX              1u
+#endif
+
 /* Maximum number of VirtIO network devices supported */
 #define VIRTIO_NET_MAX_DEVICES         2u
 

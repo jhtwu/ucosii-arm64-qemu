@@ -24,6 +24,7 @@
 | TX used-index-only polling | 862.3 → 875.7 Mbps | 約 +1.5% | 1006.7 → 1050 Mbps | 約 +4.3% | 採用；降低每包 cache invalidate 範圍，但增益小於量測波動，需持續以多輪 A/B 觀察 |
 | TX notify batch size 16 → 32 | 865.3 → 922.7 Mbps | 約 **+6.6%** | 1033.3 → 1036.7 Mbps | 約 +0.3% | config sweep 與第二輪確認支持 32；已設定為 default 並已 push（commit `ad272e6`） |
 | TX TCP/UDP checksum offload step 1 | 902.2 → 910.7 Mbps | 約 **+0.9%** | 1027.0 → 1068.5 Mbps | 約 **+4.0%** | corrected BPI A/B 三次各方向均成功；只協商 `VIRTIO_NET_F_CSUM`，採用 |
+| VirtIO used-event IRQ suppression step 2 | 920.3 → 941.4 Mbps | 約 **+2.3%** | 1032.0 → 1106.7 Mbps | 約 **+7.2%** | 只使用 `used_event` 抑制裝置 IRQ；BPI A/B 12 次全數完成，採用 |
 | RX IRQ minimal + task poll | full ISR 不可持續 → 835 Mbps | N/A† | full ISR 未完成 → 975 Mbps | N/A† | **採用候選；將 RX used-ring drain 移到 task，避免單 vCPU 被 IRQ drain 佔滿** |
 | RX used-ring incremental invalidate | 850.0 → 852.0 Mbps | 約 +0.2% | 1003.5 → 988.7 Mbps | 約 -1.5% | 正確性與 cache 工作量改善，但 throughput 未見可辨識增益，暫不宣稱效能提升 |
 | RX recycle/avail-ring batching | 886 → 858 Mbps | 約 -3.2% | 1037 → 1040 Mbps | 約 +0.3% | `agy` review PASS；降低重複 cache clean，但本次 BPI A/B 未證明 throughput 收益，暫保留作候選 |
@@ -101,6 +102,19 @@
 
 另以 offload enabled image 做 raw packet capture：在只屬於測試 namespace 的 WAN veth 關閉 TX checksum/GSO/GRO/TSO 後，guest → WAN 的 TCP 封包均被 tcpdump 判定為 `cksum correct`，UDP 封包均顯示 `[udp sum ok]`。未關閉該 veth offload 時看到的 pseudo-header partial checksum 是預期的 VirtIO 傳輸中間狀態，不是 wire checksum failure。測試只建立並清除 `ucsi5`/`ucsi7`/`ucsi8` namespace、bridge、TAP 與 veth，未修改既有 BPI network 或 DrayOS QEMU。
 
+### VirtIO used-event IRQ suppression step 2 的 BPI A/B 數據
+
+這組測試固定使用已採用的 RX task-poll、TX batch size 32、TX checksum offload、BPI-R4 KVM/vhost、1 vCPU、512 MiB，以及 QEMU `csum=on`、GSO/TSO/guest checksum/mergeable RX buffer 關閉；只比較編譯 config `VIRTIO_NET_EVENT_IDX=0/1`。每個 case 都重新啟動 guest，TX 與 reverse-RX 各跑 3 次。
+
+step 2 最終只採用 split-ring 的 `used_event`：guest 在讀到新的 used index 後，更新 avail ring 的 `used_event`，讓 host 只在有新的 completion 時產生 guest IRQ；原本嘗試同時用 `avail_event` 抑制 guest→host 的 queue notify，在 BPI smoke 中造成 TX queue completion notification 遺失而 timeout，因此已撤回。保留原有 batch notify 是為了避免這個 correctness risk。
+
+| 狀態 | TX runs（LAN → WAN） | TX mean | reverse-RX runs（WAN → LAN） | reverse-RX mean |
+|---|---|---:|---|---:|
+| `VIRTIO_NET_EVENT_IDX=0` | 922.8, 924.4, 913.7 Mbps | 920.3 Mbps | 990.3, 1030.3, 1075.4 Mbps | 1032.0 Mbps |
+| `VIRTIO_NET_EVENT_IDX=1` | 984.3, 937.8, 902.2 Mbps | 941.4 Mbps | 1112.4, 1086.5, 1121.1 Mbps | 1106.7 Mbps |
+
+相對改善為 TX 約 **+2.3%**、reverse-RX 約 **+7.2%**。12 次 iperf3 全部正常完成，所有 LAN/WAN gateway ping 均為 0% packet loss；測試只建立並清除 `u11q`/`u11c`/`u11s` namespace、bridge、TAP 與 veth，未修改既有 BPI network 或 DrayOS QEMU。
+
 ## 未獨立量測的既有調整
 
 以下功能在本次量測開始前已存在於 branch，沒有相同條件的獨立 baseline，因此不填造改善百分比：
@@ -121,4 +135,4 @@
 
 ## Current decision
 
-目前保留並已 push 的主要效能修正是 used-ring alignment、cache ordering 調整、checksum path、used-index-only polling、RX IRQ minimal + task poll、RX used-ring incremental invalidate（commit `121ab18`），RX recycle/avail-ring batching（commit `c0817e7`），以及 TX notify batch size 32（commit `ad272e6`）。TX checksum offload step 1 已完成 corrected BPI A/B、TCP/UDP raw checksum 驗證與 agy review PASS，確認 reverse-RX 約 4.0% 改善、TX 約 0.9% 改善。zero-copy forwarding 只完成候選實驗，因為在 BPI 實測明顯降低 throughput，已撤回，不會進入正式版本。
+目前保留並已 push 的主要效能修正是 used-ring alignment、cache ordering 調整、checksum path、used-index-only polling、RX IRQ minimal + task poll、RX used-ring incremental invalidate（commit `121ab18`），RX recycle/avail-ring batching（commit `c0817e7`），以及 TX notify batch size 32（commit `ad272e6`）。TX checksum offload step 1 已完成 corrected BPI A/B、TCP/UDP raw checksum 驗證與 agy review PASS，確認 reverse-RX 約 4.0% 改善、TX 約 0.9% 改善。step 2 的 used-event-only IRQ suppression 已完成 BPI A/B 與 agy review PASS：TX 約 +2.3%、reverse-RX 約 +7.2%，準備 commit/push。zero-copy forwarding 只完成候選實驗，因為在 BPI 實測明顯降低 throughput，已撤回，不會進入正式版本。
