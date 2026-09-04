@@ -119,7 +119,8 @@ struct virtio_net_device {
     uint8_t *tx_buffers[VIRTIO_NET_QUEUE_SIZE];
     OS_EVENT *rx_sem;
     uint16_t tx_batch_count;   /* frames queued but host not yet notified */
-    uint8_t rx_recycle_pending; /* RX avail updates awaiting a queue notify */
+    uint16_t rx_recycle_start;  /* first avail slot in pending recycle batch */
+    uint16_t rx_recycle_count;  /* RX avail entries awaiting cache/notify */
 };
 
 /* Multiple device support */
@@ -273,6 +274,8 @@ static void virtio_net_prepare_rx(struct virtio_net_device *dev, size_t dev_idx)
     }
     avail->idx = dev->rx_queue_size;
     dev->rx_last_used = 0u;
+    dev->rx_recycle_start = 0u;
+    dev->rx_recycle_count = 0u;
     g_rx_completion_head[dev_idx] = 0u;
     g_rx_completion_tail[dev_idx] = 0u;
     g_rx_completion_count[dev_idx] = 0u;
@@ -312,6 +315,90 @@ static uint16_t virtio_net_read_rx_used_idx(struct virtio_net_device *dev)
     return used->idx;
 }
 
+static void virtio_net_flush_rx_recycle(struct virtio_net_device *dev)
+{
+    struct vring_avail *avail;
+    uint16_t queue_size;
+    uint16_t first;
+    uint16_t count;
+    uint16_t first_chunk;
+
+    if (dev == NULL || dev->rx_queue == NULL) {
+        return;
+    }
+
+    count = dev->rx_recycle_count;
+    if (count == 0u) {
+        return;
+    }
+
+    queue_size = dev->rx_queue_size;
+    if (queue_size == 0u) {
+        dev->rx_recycle_count = 0u;
+        return;
+    }
+    if (count > queue_size) {
+        /* This indicates corrupted recycle state; bound cache maintenance. */
+        uart_puts("[virtio-net] RX recycle batch overrun\n");
+        count = queue_size;
+    }
+
+    avail = dev->rx_queue->avail;
+    first = dev->rx_recycle_start;
+    if (first >= queue_size) {
+        first = 0u;
+    }
+
+    /* The pending batch can straddle the end of the avail ring. */
+    first_chunk = (uint16_t)(queue_size - first);
+    if (first_chunk > count) {
+        first_chunk = count;
+    }
+    cache_clean_range_nosync(&avail->ring[first],
+                             (size_t)first_chunk * sizeof(uint16_t));
+    if (first_chunk < count) {
+        cache_clean_range_nosync(&avail->ring[0],
+                                 (size_t)(count - first_chunk) * sizeof(uint16_t));
+    }
+
+    cache_sync();
+    /* Publish all ring entries before exposing the new avail index. */
+    cache_clean_range_nosync(&avail->idx, sizeof(avail->idx));
+    cache_sync();
+    virtio_reg_write(dev, VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_RX_QUEUE);
+    dev->rx_recycle_count = 0u;
+}
+
+static void virtio_net_recycle_rx_desc(struct virtio_net_device *dev,
+                                       uint16_t desc_id)
+{
+    struct vring_avail *avail;
+    uint16_t queue_size;
+    uint16_t avail_slot;
+
+    if (dev == NULL || dev->rx_queue == NULL) {
+        return;
+    }
+
+    queue_size = dev->rx_queue_size;
+    if (queue_size == 0u) {
+        return;
+    }
+
+    avail = dev->rx_queue->avail;
+    avail_slot = (uint16_t)(avail->idx % queue_size);
+    if (dev->rx_recycle_count == 0u) {
+        dev->rx_recycle_start = avail_slot;
+    }
+    avail->ring[avail_slot] = desc_id;
+    avail->idx++;
+    dev->rx_recycle_count++;
+
+    if (dev->rx_recycle_count >= VIRTIO_NET_RX_RECYCLE_BATCH_SIZE) {
+        virtio_net_flush_rx_recycle(dev);
+    }
+}
+
 static void virtio_net_invalidate_rx_used_entries(struct virtio_net_device *dev,
                                                   uint16_t first_used,
                                                   uint16_t pending)
@@ -340,10 +427,8 @@ static int virtio_net_drain_rx_used(struct virtio_net_device *dev, size_t dev_id
     uint16_t queue_size = dev->rx_queue_size;
     uint16_t used_idx;
     uint16_t pending;
-    uint8_t notify_device = 0u;
     int enqueued = 0;
     struct vring_used *used = queue->used;
-    struct vring_avail *avail = queue->avail;
 
     if (queue_size == 0u) {
         return 0;
@@ -382,13 +467,9 @@ static int virtio_net_drain_rx_used(struct virtio_net_device *dev, size_t dev_id
 
         if (g_rx_completion_count[dev_idx] >= queue_size) {
             uart_puts("[virtio-net] RX completion queue full\n");
-            uint16_t slot = (uint16_t)(avail->idx % queue_size);
-            avail->ring[slot] = desc_id;
-            cache_clean_range_nosync(&avail->ring[slot], sizeof(uint16_t));
-            avail->idx++;
-            cache_clean_range_nosync(&avail->idx, sizeof(avail->idx));
+            virtio_net_recycle_rx_desc(dev, desc_id);
+            virtio_net_flush_rx_recycle(dev);
             dev->rx_last_used++;
-            notify_device = 1u;
             continue;
         }
 
@@ -399,11 +480,6 @@ static int virtio_net_drain_rx_used(struct virtio_net_device *dev, size_t dev_id
         enqueued++;
 
         dev->rx_last_used++;
-    }
-
-    if (notify_device != 0u) {
-        cache_sync();
-        virtio_reg_write(dev, VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_RX_QUEUE);
     }
 
     return enqueued;
@@ -870,14 +946,7 @@ void virtio_net_rx_flush_dev(size_t dev_idx)
         return;
     }
     struct virtio_net_device *dev = &g_devices[dev_idx];
-    if (dev == NULL) {
-        return;
-    }
-    if (dev->rx_recycle_pending != 0u) {
-        cache_sync();
-        virtio_reg_write(dev, VIRTIO_MMIO_QUEUE_NOTIFY, VIRTIO_NET_RX_QUEUE);
-        dev->rx_recycle_pending = 0u;
-    }
+    virtio_net_flush_rx_recycle(dev);
 }
 
 int virtio_net_poll_frame_dev(virtio_net_dev_t dev, uint8_t *out_frame, size_t *out_length)
@@ -938,13 +1007,11 @@ int virtio_net_poll_frame_dev(virtio_net_dev_t dev, uint8_t *out_frame, size_t *
         }
     }
 
-    struct vring_avail *avail = dev->rx_queue->avail;
-    uint16_t avail_slot = (uint16_t)(avail->idx % dev->rx_queue_size);
-    avail->ring[avail_slot] = desc_id;
-    cache_clean_range_nosync(&avail->ring[avail_slot], sizeof(avail->ring[avail_slot]));
-    avail->idx++;
-    cache_clean_range_nosync(&avail->idx, sizeof(avail->idx));
-    dev->rx_recycle_pending = 1u;
+    virtio_net_recycle_rx_desc(dev, desc_id);
+    /* Direct poll callers may not call rx_flush_dev() themselves. */
+    if (!virtio_net_has_pending_rx_dev(dev)) {
+        virtio_net_flush_rx_recycle(dev);
+    }
 
     return (payload_len > 0u) ? 1 : 0;
 }
@@ -1033,13 +1100,7 @@ void virtio_net_release_rx_buffer_dev(virtio_net_dev_t dev, uint16_t desc_id)
     g_rx_completion_count[dev_idx]--;
     OS_EXIT_CRITICAL();
 
-    struct vring_avail *avail = dev->rx_queue->avail;
-    uint16_t avail_slot = (uint16_t)(avail->idx % dev->rx_queue_size);
-    avail->ring[avail_slot] = desc_id;
-    cache_clean_range_nosync(&avail->ring[avail_slot], sizeof(avail->ring[avail_slot]));
-    avail->idx++;
-    cache_clean_range_nosync(&avail->idx, sizeof(avail->idx));
-    dev->rx_recycle_pending = 1u;
+    virtio_net_recycle_rx_desc(dev, desc_id);
 }
 
 const uint8_t *virtio_net_get_mac_dev(virtio_net_dev_t dev)

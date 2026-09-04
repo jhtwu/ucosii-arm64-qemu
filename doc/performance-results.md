@@ -24,6 +24,7 @@
 | TX used-index-only polling | 862.3 → 875.7 Mbps | 約 +1.5% | 1006.7 → 1050 Mbps | 約 +4.3% | 採用；降低每包 cache invalidate 範圍，但增益小於量測波動，需持續以多輪 A/B 觀察 |
 | RX IRQ minimal + task poll | full ISR 不可持續 → 835 Mbps | N/A† | full ISR 未完成 → 975 Mbps | N/A† | **採用候選；將 RX used-ring drain 移到 task，避免單 vCPU 被 IRQ drain 佔滿** |
 | RX used-ring incremental invalidate | 850.0 → 852.0 Mbps | 約 +0.2% | 1003.5 → 988.7 Mbps | 約 -1.5% | 正確性與 cache 工作量改善，但 throughput 未見可辨識增益，暫不宣稱效能提升 |
+| RX recycle/avail-ring batching | 886 → 858 Mbps | 約 -3.2% | 1037 → 1040 Mbps | 約 +0.3% | `agy` review PASS；降低重複 cache clean，但本次 BPI A/B 未證明 throughput 收益，暫保留作候選 |
 | RX buffer zero-copy forwarding candidate | 845.0 → 520.5 Mbps | -38.4% | 1030.0 → 346.0 Mbps | -66.4% | 不採用，已撤回未提交改動 |
 
 † Full-ISR baseline 在本次同條件測試中前 4–5 秒約 770–895 Mbps，之後降為 0 並 timeout，因此沒有可與完整 10 秒 task-poll 結果直接計算的 steady-state baseline；N/A 不代表沒有改善，而是 baseline 沒有完成可比測量。
@@ -61,6 +62,17 @@
 
 這組比較固定使用已採用的 task-poll 模式，只改變 RX used-ring cache invalidate 範圍：baseline 每次 invalidate 整個 used ring；新版本先讀取 `used->idx`，只 invalidate 自上次 drain 以來新增的 entries，並處理 ring wrap。Baseline 跑 2 次、新版本跑 3 次，結果分別為 TX **850.0 → 852.0 Mbps**、RX **1003.5 → 988.7 Mbps**；差異落在量測波動內，沒有可辨識的 throughput 改善。
 
+### RX recycle/avail-ring batching 的 BPI A/B 數據
+
+這組比較固定使用 task-poll 與 incremental used-ring invalidate，只改變 RX descriptor recycle 的 cache clean/notify 行為。新版本以 `VIRTIO_NET_RX_RECYCLE_BATCH_SIZE=16` 累積 avail ring 更新，並在 publish `avail->idx` 前加入 cache barrier；direct poll 與 completion queue full 路徑也會確實 flush。兩個版本各跑 3 次，每次 TX/RX 10 秒：
+
+| 狀態 | TX receiver runs | TX mean | RX receiver runs | RX mean |
+|---|---|---:|---|---:|
+| baseline | 880, 897, 881 Mbps | 886 Mbps | 1.05, 1.04, 1.02 Gbps | 約 1037 Mbps |
+| recycle batching | 848, 865, 861 Mbps | 858 Mbps | 1.05, 1.03, 1.04 Gbps | 約 1040 Mbps |
+
+相對 baseline 為 TX 約 **-3.2%**、RX 約 **+0.3%**。雙向 ping 均為 0% packet loss，6 次 iperf3 均正常完成；目前只能確認正確性與減少重複 cache clean，不能宣稱穩定 throughput 改善。
+
 ## 未獨立量測的既有調整
 
 以下功能在本次量測開始前已存在於 branch，沒有相同條件的獨立 baseline，因此不填造改善百分比：
@@ -82,4 +94,4 @@
 
 ## Current decision
 
-目前保留並已 push 的主要效能修正是 used-ring alignment、cache ordering 調整與 checksum path；used-index-only polling 與 RX IRQ minimal + task poll 已完成本地與 BPI A/B 測試，尚未 commit/push。RX used-ring incremental invalidate 已完成 review、build 與 BPI A/B，正確但暫未證明 throughput 收益，尚未 commit/push。zero-copy forwarding 只完成候選實驗，因為在 BPI 實測明顯降低 throughput，已撤回，不會進入正式版本。
+目前保留並已 push 的主要效能修正是 used-ring alignment、cache ordering 調整、checksum path、used-index-only polling、RX IRQ minimal + task poll，以及 RX used-ring incremental invalidate（commit `121ab18`）。RX recycle/avail-ring batching 已完成 build、BPI A/B 與 `agy` review（PASS），但目前 A/B 未證明 throughput 收益，變更仍在 working tree，待決定是否保留。zero-copy forwarding 只完成候選實驗，因為在 BPI 實測明顯降低 throughput，已撤回，不會進入正式版本。

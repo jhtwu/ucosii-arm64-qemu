@@ -18,6 +18,14 @@
 #define VIRTIO_NET_RX_DEFER_POLL        1u
 #endif
 
+/* Number of recycled RX descriptors to publish per cache/notify batch. */
+#ifndef VIRTIO_NET_RX_RECYCLE_BATCH_SIZE
+#define VIRTIO_NET_RX_RECYCLE_BATCH_SIZE 16u
+#endif
+#if VIRTIO_NET_RX_RECYCLE_BATCH_SIZE < 1u
+#error "VIRTIO_NET_RX_RECYCLE_BATCH_SIZE must be at least 1"
+#endif
+
 /* Maximum number of VirtIO network devices supported */
 #define VIRTIO_NET_MAX_DEVICES         2u
 
